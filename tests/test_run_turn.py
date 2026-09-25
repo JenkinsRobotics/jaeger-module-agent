@@ -153,6 +153,20 @@ def test_parallel_tool_calls_dispatched_in_one_assistant_turn():
     assert all('"pong"' in m["content"] for m in tool_rows)
 
 
+def test_parallel_memory_reads_are_forced_serial() -> None:
+    """Two recalls must not concurrently use the singleton SQLite handle."""
+    @register_tool("recall", "Recall.", _SmallArgs, side_effect="read")
+    def _recall(value: str = "x") -> dict:
+        return {"value": value}
+
+    agent = JaegerAgent(adapter=_ScriptedAdapter([]))
+    calls = [
+        {"id": "c1", "name": "recall", "arguments": {"value": "a"}},
+        {"id": "c2", "name": "recall", "arguments": {"value": "b"}},
+    ]
+    assert agent._batch_is_parallel_safe(calls) is False
+
+
 # ── tool error paths ───────────────────────────────────────────────
 
 
@@ -451,11 +465,11 @@ def _install_fake_usage_stats(monkeypatch) -> list[tuple]:
     Until 1.0.3 this had to fabricate a whole ``jaeger_ai.core.runtime``
     module tree, because the loop imported the app's usage_stats directly
     and jaeger-ai is not a dependency of this package. The counters are
-    the module's own now (``jaeger_agent.usage``), so the test patches one
+    the module's own now (``jaeger_agent.core.usage``), so the test patches one
     function and the fake package tree is gone — which is the coupling
     removal showing up as less test scaffolding.
     """
-    from jaeger_agent import usage
+    from jaeger_agent.core import usage
 
     calls: list[tuple] = []
     monkeypatch.setattr(

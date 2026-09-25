@@ -102,6 +102,23 @@ def test_a_genuinely_unknown_toolset_still_raises() -> None:
         resolve_toolsets({"no_such_toolset_anywhere"})
 
 
+def test_host_can_force_scoping_for_one_agent_without_process_env(
+    app_tool, monkeypatch,
+) -> None:
+    """A context-tight face scopes locally while ordinary agents stay full."""
+    monkeypatch.delenv("JAEGER_TOOLSET_SCOPING", raising=False)
+    toolset_scoping.reset_toolsets()
+    scoped = _agent(tool_visibility=toolset_scoping.scoped_tool_visible)
+    ordinary = _agent(tool_visibility=toolset_scoping.tool_visible)
+
+    assert app_tool not in scoped.tool_names()
+    assert app_tool in ordinary.tool_names()
+
+    toolset_scoping.register_toolset("probeset", [app_tool], "host tools")
+    assert toolset_scoping.enable_toolset("probeset") is True
+    assert app_tool in scoped.tool_names()
+
+
 def test_instance_skills_merge_with_bundled_ones(tmp_path, monkeypatch) -> None:
     """The skills half, which already worked: discovery reads the bundled
     tree AND the bound instance's, so a host (or the agent itself) can add

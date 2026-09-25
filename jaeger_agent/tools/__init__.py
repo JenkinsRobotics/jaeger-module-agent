@@ -25,7 +25,7 @@ Categories:
 from __future__ import annotations
 
 # Framework wiring (call bind() once at startup)
-from jaeger_agent.workspace import (
+from jaeger_agent.core.workspace import (
     SandboxError,
     _audit,
     _require_layout,
@@ -179,6 +179,8 @@ __all__ = [
     # framework wiring
     "bind", "get_layout",
     "SandboxError", "_audit", "_require_layout", "_resolve_under", "git_autocommit",
+    # introspection and reflection
+    "describe_tool", "load_tools", "reflect",
     # files
     "file_write", "file_read", "list_skill_dir", "append_file", "delete_file",
     "edit_file", "search_files", "reset_read_tracker", "move_file", "copy_file",

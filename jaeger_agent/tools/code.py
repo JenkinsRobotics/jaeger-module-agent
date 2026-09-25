@@ -19,7 +19,7 @@ import time
 from typing import Any
 
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
-from jaeger_agent.workspace import _audit, _require_layout
+from jaeger_agent.core.workspace import _audit, _require_layout
 from jaeger_os.core.safety.command_guard import hardline_guard
 from jaeger_os.core.safety.permissions import PermissionTier, requires_tier
 from jaeger_agent.util.tool_interrupt import ToolInterrupted, run_interruptible
@@ -52,7 +52,7 @@ def run_python(code: str, timeout_s: float = 10.0) -> dict[str, Any]:
     # is bound (standalone tests).
     workdir = None
     try:
-        from jaeger_agent.workspace import _require_layout
+        from jaeger_agent.core.workspace import _require_layout
         workdir = _require_layout().skills_dir
         workdir.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -136,7 +136,7 @@ def run_shell(command: str, timeout_s: float = 60.0) -> dict[str, Any]:
     # Audit every shell invocation, even before it runs — the audit log
     # is the tamper-evident record of what the agent was permitted to do.
     try:
-        layout = _require_layout()
+        _require_layout()
         _audit("run_shell", {"command": cleaned[:500], "timeout_s": timeout})
     except Exception:  # noqa: BLE001
         pass

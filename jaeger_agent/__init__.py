@@ -6,9 +6,9 @@ surfaces, model bundles, and robot-specific policy remain outside it.
 
 import os
 
-from .bridge import AgentBridge
-from .config import AgentConfig
-from .contracts import AgentRuntime, RuntimeEvents, TurnResult
+from .core.bridge import AgentBridge
+from .core.config import AgentConfig, MultimodalConfig
+from .core.contracts import AgentRuntime, RuntimeEvents, TurnResult
 from .adapters.anthropic import AnthropicAdapter
 from .adapters.base import KNOWN_FEATURES, ProviderAdapter
 from .adapters.hermes_xml import HermesXMLAdapter
@@ -18,7 +18,7 @@ from .adapters.openai import OpenAIAdapter
 from .loop.callbacks import AgentCallbacks
 from .loop.interrupt import AgentInterrupted, StaleCallTimeout, interruptible_call
 from .loop.jaeger_agent import JaegerAgent, SkipFinalFinalizer
-from .messages import (
+from .core.messages import (
     AgentActivity,
     AgentRequest,
     AgentResponse,
@@ -28,7 +28,7 @@ from .messages import (
     ModeState,
     ToolEvent,
 )
-from .node import MindNode, make_mind_node
+from .core.node import MindNode, make_mind_node
 from .parsing import schema_sanitizer
 from .schemas.message_types import Message, Role, ToolCall
 from .util.retry_utils import jittered_backoff, retry_with_backoff
@@ -45,7 +45,7 @@ from jaeger_os.core.tools.tool_registry import (
 )
 from jaeger_os.core.tools.tool_schema import ToolDef, dev_mode_enabled
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 # ── lazy exports (PEP 562) ───────────────────────────────────────────
@@ -57,6 +57,10 @@ __version__ = "1.1.0"
 # attribute access keeps the graph acyclic and keeps `import
 # jaeger_agent` cheap for an embedder that only wants the loop.
 _LAZY = {
+    "Event":            ("jaeger_agent.core.events", "Event"),
+    "GemmaMultimodal":  ("jaeger_agent.core.engine", "GemmaMultimodal"),
+    "MultimodalAgent":  ("jaeger_agent.core.engine", "MultimodalAgent"),
+    "SpeechRuntime":    ("jaeger_agent.core.speech", "SpeechRuntime"),
     "JAEGER_TOOLSETS":  ("jaeger_agent.schemas.tool_bundles", "JAEGER_TOOLSETS"),
     "list_toolsets":    ("jaeger_agent.schemas.tool_bundles", "list_toolsets"),
     "resolve_toolsets": ("jaeger_agent.schemas.tool_bundles", "resolve_toolsets"),
@@ -92,6 +96,7 @@ __all__ = [
     "AgentBridge",
     "AgentCallbacks",
     "AgentConfig",
+    "MultimodalConfig",
     "AgentInterrupted",
     "AgentRequest",
     "AgentResponse",
@@ -100,6 +105,8 @@ __all__ = [
     "AnthropicAdapter",
     "ChatMessage",
     "ChatReply",
+    "Event",
+    "GemmaMultimodal",
     "HermesXMLAdapter",
     "JaegerAgent",
     "KNOWN_FEATURES",
@@ -108,12 +115,14 @@ __all__ = [
     "Message",
     "MindNode",
     "ModeState",
+    "MultimodalAgent",
     "OpenAIAdapter",
     "ProviderAdapter",
     "Role",
     "RuntimeEvents",
     "SkipFinalFinalizer",
     "StaleCallTimeout",
+    "SpeechRuntime",
     "ToolEvent",
     "ToolCall",
     "ToolDef",

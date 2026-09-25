@@ -1,0 +1,225 @@
+{
+  "schema": "multimodal-agent-result-v1",
+  "benchmark": "gemma-multimodal-comparison-v1",
+  "engine": "jaeger-agent-agentruntime",
+  "suite": "selected",
+  "created_at": "2026-09-03T10:29:43-0700",
+  "load_ms": 18429.97,
+  "cases": [
+    {
+      "id": "spoken_q00",
+      "modality": "spoken",
+      "response": "Two plus two equals four.",
+      "transcript": "What is 2 plus 2?",
+      "total_ms": 8683.5,
+      "first_audio_ms": null,
+      "audio_samples": 0,
+      "audio_rate": 24000,
+      "output_channels": [
+        "text"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q01",
+      "modality": "spoken",
+      "response": "The sky is typically blue during the day, but it can appear many different colors depending on the time of day or weather conditions.",
+      "transcript": "What color is the sky?",
+      "total_ms": 9988.97,
+      "first_audio_ms": 9988.92,
+      "audio_samples": 192000,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q02",
+      "modality": "spoken",
+      "response": "There are seven days in a week.",
+      "transcript": "How many days in a week?",
+      "total_ms": 8695.93,
+      "first_audio_ms": null,
+      "audio_samples": 0,
+      "audio_rate": 24000,
+      "output_channels": [
+        "text"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q03",
+      "modality": "spoken",
+      "response": "The capital of France is Paris.",
+      "transcript": "What is the capital of France?",
+      "total_ms": 9074.43,
+      "first_audio_ms": 9074.39,
+      "audio_samples": 55200,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q04",
+      "modality": "spoken",
+      "response": "Ten minus three is seven.",
+      "transcript": "What is 10 minus 3?",
+      "total_ms": 8628.62,
+      "first_audio_ms": null,
+      "audio_samples": 0,
+      "audio_rate": 24000,
+      "output_channels": [
+        "text"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q05",
+      "modality": "spoken",
+      "response": "A spider has eight legs.",
+      "transcript": "How many legs does a spider have?",
+      "total_ms": 8947.07,
+      "first_audio_ms": 8947.02,
+      "audio_samples": 49200,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q06",
+      "modality": "spoken",
+      "response": "The largest planet in our solar system is Jupiter.",
+      "transcript": "What is the largest planet?",
+      "total_ms": 9181.02,
+      "first_audio_ms": 9180.97,
+      "audio_samples": 84000,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q07",
+      "modality": "spoken",
+      "response": "Five times five is twenty-five.",
+      "transcript": "What is 5 times 5?",
+      "total_ms": 8672.79,
+      "first_audio_ms": null,
+      "audio_samples": 0,
+      "audio_rate": 24000,
+      "output_channels": [
+        "text"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q08",
+      "modality": "spoken",
+      "response": "The season that comes after summer is autumn, which is also known as fall.",
+      "transcript": "What season comes after summer?",
+      "total_ms": 9451.16,
+      "first_audio_ms": 9451.12,
+      "audio_samples": 111600,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q09",
+      "modality": "spoken",
+      "response": "There are twenty-four hours in a day.",
+      "transcript": "How many hours in a day?",
+      "total_ms": 9120.39,
+      "first_audio_ms": 9120.35,
+      "audio_samples": 59400,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q10",
+      "modality": "spoken",
+      "response": "The freezing point of water is zero degrees Celsius or thirty-two degrees Fahrenheit.",
+      "transcript": "What is the freezing point of water?",
+      "total_ms": 9564.06,
+      "first_audio_ms": 9564.02,
+      "audio_samples": 138000,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    },
+    {
+      "id": "spoken_q11",
+      "modality": "spoken",
+      "response": "William Shakespeare wrote Romeo and Juliet.",
+      "transcript": "who wrote Romeo and Juliet.",
+      "total_ms": 9102.18,
+      "first_audio_ms": 9102.14,
+      "audio_samples": 71400,
+      "audio_rate": 24000,
+      "output_channels": [
+        "speech"
+      ],
+      "output_source": "model-output-directive",
+      "error": null
+    }
+  ],
+  "configuration": {
+    "model": "/Users/jonathanjenkins/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf",
+    "model_precision": "Q4_K_M",
+    "audio_mode": "plain",
+    "play": false,
+    "temperature": 0.0,
+    "max_tokens": 160,
+    "ctx": 8192,
+    "agentic_tools": true,
+    "toolset_scoping": true,
+    "selected_ids": [
+      "spoken_q00",
+      "spoken_q01",
+      "spoken_q02",
+      "spoken_q03",
+      "spoken_q04",
+      "spoken_q05",
+      "spoken_q06",
+      "spoken_q07",
+      "spoken_q08",
+      "spoken_q09",
+      "spoken_q10",
+      "spoken_q11"
+    ],
+    "visible_tools": 20,
+    "available_tools": 105,
+    "memory_owner": "AgentRuntime",
+    "audio_output": "synthesized Kokoro af_heart PCM at 24000 Hz"
+  },
+  "environment": {
+    "jaeger_agent": "1.2.0",
+    "python": "3.11.9",
+    "platform": "macOS-26.6.2-arm64-arm-64bit",
+    "machine": "arm64"
+  }
+}

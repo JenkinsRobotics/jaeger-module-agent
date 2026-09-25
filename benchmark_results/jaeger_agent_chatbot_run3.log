@@ -1,0 +1,251 @@
+[jaeger-skills] 2 skill(s) provide tools (registered): computer_use@1.0.0(core), macos_computer@1.0.0(core)
+[jaeger-skills] 107 skill(s) provide a recipe (loadable via use_skill).
+[jaeger-skills] agentic surface: 107 tools · 2 tool-providing skill(s) · 107 recipe skill(s).
+[gemma-multimodal] loading vision projector mmproj-gemma-4-E4B-it-BF16.gguf…
+[gemma-multimodal] using injected AgentRuntime (runtime-owned conversation memory)
+[gemma-multimodal] warming AgentRuntime brain…
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+ready<turn|>
+<|turn>model
+
+[gemma-multimodal] loading Kokoro…
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+/Users/jonathanjenkins/GITHUB/VoiceLLM-Playground/.venv/lib/python3.11/site-packages/torch/nn/modules/rnn.py:1011: UserWarning: dropout option adds dropout after all but last recurrent layer, so non-zero dropout expects num_layers greater than 1, but got dropout=0.2 and num_layers=1
+  super().__init__("LSTM", *args, **kwargs)
+/Users/jonathanjenkins/GITHUB/VoiceLLM-Playground/.venv/lib/python3.11/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+WARNING: Defaulting repo_id to hexgrad/Kokoro-82M. Pass repo_id='hexgrad/Kokoro-82M' to suppress this warning.
+[gemma-multimodal] loading Whisper large-v3-turbo…
+whisper_init_from_file_with_params_no_state: loading model from '/Users/jonathanjenkins/Library/Application Support/pywhispercpp/models/ggml-large-v3-turbo.bin'
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: flash attn = 1
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.006 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 26800.60 MB
+whisper_init_with_params_no_state: devices    = 3
+whisper_init_with_params_no_state: backends   = 3
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51866
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 1280
+whisper_model_load: n_audio_head  = 20
+whisper_model_load: n_audio_layer = 32
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 1280
+whisper_model_load: n_text_head   = 20
+whisper_model_load: n_text_layer  = 4
+whisper_model_load: n_mels        = 128
+whisper_model_load: ftype         = 1
+whisper_model_load: qntvr         = 0
+whisper_model_load: type          = 5 (large v3)
+whisper_model_load: adding 1609 extra tokens
+whisper_model_load: n_langs       = 100
+whisper_model_load:         MTL0 total size =  1623.92 MB
+whisper_model_load: model size    = 1623.92 MB
+whisper_backend_init_gpu: device 0: MTL0 (type: 1)
+whisper_backend_init_gpu: found GPU device 0: MTL0 (type: 1, cnt: 0)
+whisper_backend_init_gpu: using MTL0 backend
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Max
+ggml_metal_init: picking default device: Apple M1 Max
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+whisper_backend_init: using BLAS backend
+whisper_init_state: kv self size  =   10.49 MB
+whisper_init_state: kv cross size =   31.46 MB
+whisper_init_state: kv pad  size  =    7.86 MB
+whisper_init_state: compute buffer (conv)   =   37.69 MB
+whisper_init_state: compute buffer (encode) =   67.31 MB
+whisper_init_state: compute buffer (cross)  =   63.03 MB
+whisper_init_state: compute buffer (decode) =  100.04 MB
+[gemma-multimodal] primed in 11850 ms
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is 17 plus 28? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_math                         1159 ms  Seventeen plus twenty-eight equals forty-five.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is the capital of Japan? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_fact                          733 ms  The capital of Japan is Tokyo.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What number comes next: 2, 4, 8, 16? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_sequence                     1452 ms  The next number in the sequence is 32. Each number is double the one b
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+Reply with exactly these two words and nothing else: amber comet<turn|>
+<|turn>model
+
+  DONE  text_instruction                   547 ms  amber comet
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+Remember these two facts for later: my project codename is Violet and its build number is 731. Reply only: remembered.<turn|>
+<|turn>model
+
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+Remember these two facts for later: my project codename is Violet and its build number is 731. Reply only: remembered.<turn|>
+<|turn>model
+Remembered.<turn|>
+<|turn>user
+What project codename and build number did I ask you to remember?<turn|>
+<|turn>model
+
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+
+add_text: <|image>
+add_media: preproc_out has 1 entries, grid_x = 0, grid_y = 0, has_overview = 0
+image_tokens->nx = 49
+image_tokens->ny = 1
+batch_f32 size = 1
+add_text: <image|>
+add_text: Identify the central shape and its color. Answer briefly.<turn|>
+<|turn>model
+
+encoding image slice...
+clip_image_batch_encode: copying image 1/1 to input buffer (nx=336, ny=336)
+clip_image_batch_encode: output embedding shape [2560, 49, 1]
+image slice encoded in 183 ms
+decoding image batch 1/1, n_tokens_batch = 49
+image decoded (batch 1/1) in 74 ms
+  DONE  vision_red_square                 1332 ms  The central shape is a square, and its color is red.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+
+add_text: <|image>
+add_media: preproc_out has 1 entries, grid_x = 0, grid_y = 0, has_overview = 0
+image_tokens->nx = 49
+image_tokens->ny = 1
+batch_f32 size = 1
+add_text: <image|>
+add_text: How many shapes are shown, what shape are they, and what color are they? Answer briefly.<turn|>
+<|turn>model
+
+encoding image slice...
+clip_image_batch_encode: copying image 1/1 to input buffer (nx=336, ny=336)
+clip_image_batch_encode: output embedding shape [2560, 49, 1]
+image slice encoded in 184 ms
+decoding image batch 1/1, n_tokens_batch = 49
+image decoded (batch 1/1) in 36 ms
+  DONE  vision_three_blue_circles         1169 ms  There are three circles shown, and they are blue.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is 2 plus 2?<turn|>
+<|turn>model
+
+  DONE  spoken_q00                        1300 ms  Two plus two equals four.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What color is the sky?<turn|>
+<|turn>model
+
+  DONE  spoken_q01                        1996 ms  The sky usually appears blue on a clear day. However, it can look whit
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+How many days in a week?<turn|>
+<|turn>model
+
+  DONE  spoken_q02                        1761 ms  There are seven days in a week. Those days are Sunday through Saturday
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is the capital of France?<turn|>
+<|turn>model
+
+  DONE  spoken_q03                        2001 ms  The capital of France is Paris. It is a very famous city known for its
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is 10 minus 3?<turn|>
+<|turn>model
+
+  DONE  spoken_q04                        1257 ms  Ten minus three is seven.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+How many legs does a spider have?<turn|>
+<|turn>model
+
+  DONE  spoken_q05                        1655 ms  A spider has eight legs. They are arachnids, not insects.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is the largest planet?<turn|>
+<|turn>model
+
+  DONE  spoken_q06                        1974 ms  Jupiter is the largest planet in our solar system. It is much bigger t
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is 5 times 5?<turn|>
+<|turn>model
+
+  DONE  spoken_q07                        1366 ms  Five times five equals twenty-five.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What season comes after summer?<turn|>
+<|turn>model
+
+  DONE  spoken_q08                        1490 ms  Autumn comes after summer. It's also sometimes called fall.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+How many hours in a day?<turn|>
+<|turn>model
+
+  DONE  spoken_q09                        2074 ms  There are twenty-four hours in a day. That's how we measure the time p
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+What is the freezing point of water?<turn|>
+<|turn>model
+
+  DONE  spoken_q10                        1821 ms  The freezing point of water is zero degrees Celsius or thirty-two degr
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.<turn|>
+<|turn>user
+who wrote Romeo and Juliet.<turn|>
+<|turn>model
+
+  DONE  spoken_q11                        1945 ms  William Shakespeare wrote Romeo and Juliet. It is considered one of th
+ggml_metal_free: deallocating
+
+Raw result: benchmark_results/jaeger_agent_chatbot_run3.json
+Cases: 19; errors: 0

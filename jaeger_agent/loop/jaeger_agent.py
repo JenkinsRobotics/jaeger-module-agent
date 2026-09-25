@@ -25,6 +25,7 @@ from typing import Any
 from typing import Callable
 
 from jaeger_agent.adapters.base import ProviderAdapter
+from jaeger_agent.core.cancellation import bind_turn_cancellation, current_cancellation
 from jaeger_agent.loop.callbacks import AgentCallbacks
 from jaeger_agent.loop.interrupt import AgentInterrupted, StaleCallTimeout
 from jaeger_agent.loop import verify_gate
@@ -303,10 +304,28 @@ class JaegerAgent:
         hidden tool's schema without loading the whole category."""
         if self._tools_filter_locked:
             # Caller passed ``tools=[...]`` explicitly — honour it.
-            return list(self._all_tools)
-        if self._tool_visibility is None:
-            return list(self._all_tools)
-        return [t for t in self._all_tools if self._tool_visibility(t.name)]
+            visible = list(self._all_tools)
+        elif self._tool_visibility is None:
+            visible = list(self._all_tools)
+        else:
+            visible = [t for t in self._all_tools if self._tool_visibility(t.name)]
+
+        # Final-output speech in a multimodal face is a typed response channel,
+        # not an agent tool. Exclude both current and legacy spellings even from
+        # an explicit tool list so no adapter can send those schemas to the
+        # model while the self-contained engine owns output.
+        try:
+            from jaeger_agent.core.outputs import multimodal_output_active
+
+            if multimodal_output_active():
+                visible = [
+                    tool
+                    for tool in visible
+                    if tool.name not in {"text_to_speech", "speak"}
+                ]
+        except Exception:  # noqa: BLE001 — tool presentation must stay safe
+            pass
+        return visible
 
     @property
     def all_tools(self) -> list[ToolDef]:
@@ -317,7 +336,8 @@ class JaegerAgent:
 
     # ── public surface ──────────────────────────────────────────────
 
-    def run_turn(self, user_message: str) -> str:
+    @bind_turn_cancellation
+    def run_turn(self, user_message: str, *, content: Any = None) -> str:
         """Run one conversational turn end-to-end.
 
         Appends the user message, then loops:
@@ -359,7 +379,8 @@ class JaegerAgent:
         self._call_signature_counts.clear()
         self._failure_signature_counts.clear()
         self._read_result_hashes.clear()
-        self._interrupt_event.clear()
+        if current_cancellation() is None:
+            self._interrupt_event.clear()
         self._turn_messages = []
         self._post_tool_nudge_used = False
         self._nudge_pending = False
@@ -391,7 +412,10 @@ class JaegerAgent:
             except Exception:  # noqa: BLE001 — a host hook must not break a turn
                 pass
 
-        self._append_message({"role": "user", "content": user_message})
+        self._append_message({
+            "role": "user",
+            "content": user_message if content is None else content,
+        })
         self._turn_active = True
         try:
             return self._run_turn_inner(user_message)
@@ -1335,6 +1359,14 @@ class JaegerAgent:
     _PATH_SCOPED_READ = frozenset({"read_file"})
     _PATH_SCOPED_WRITE = frozenset({
         "write_file", "append_file", "edit_file", "patch", "delete_file"})
+    # These are logically read-only but share the process-wide SQLite
+    # connection. ``check_same_thread=False`` permits a connection to move
+    # between threads; it does not make simultaneous cursor use on that one
+    # connection safe. Gemma commonly emits two ``recall`` calls together,
+    # so keep memory reads serial while other independent reads still fan out.
+    _SERIAL_READ_TOOLS = frozenset({
+        "recall", "list_facts", "search_memory", "session_search",
+    })
 
     @staticmethod
     def _call_path(tc: ToolCall) -> str | None:
@@ -1364,6 +1396,8 @@ class JaegerAgent:
             if tool_def is None:
                 return False
             if getattr(tool_def, "interactive", False):
+                return False
+            if name in self._SERIAL_READ_TOOLS:
                 return False
             is_read = getattr(tool_def, "side_effect", "") == "read"
             is_scoped = name in self._PATH_SCOPED_READ \
@@ -1628,7 +1662,7 @@ class JaegerAgent:
         # outcome and duration already resolved, so count it here rather
         # than at each call site. Best-effort: telemetry never breaks a turn.
         try:
-            from jaeger_agent.usage import record_tool
+            from jaeger_agent.core.usage import record_tool
             record_tool(name, ok=_ok, elapsed=elapsed)
         except Exception:  # noqa: BLE001
             pass
@@ -1867,7 +1901,7 @@ def _classify_adapter_error(exc: BaseException) -> str:
     unavailable or chokes — UNKNOWN means "no retry, next adapter",
     which is the pre-classification behaviour."""
     try:
-        from jaeger_agent.errors import classify_exception
+        from jaeger_agent.core.errors import classify_exception
         return classify_exception(exc)
     except Exception:  # noqa: BLE001 — classification must never mask the error
         return "unknown"

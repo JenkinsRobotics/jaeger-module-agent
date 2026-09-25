@@ -19,6 +19,6 @@ InstanceLayouts, which are application shapes.
 
 from __future__ import annotations
 
-from .cases import CASES, UMBRELLA_EQUIVALENTS, BenchCase, all_tags
+from .cases import BENCHMARK_VERSION, CASES, UMBRELLA_EQUIVALENTS, BenchCase, all_tags
 
-__all__ = ["CASES", "UMBRELLA_EQUIVALENTS", "BenchCase", "all_tags"]
+__all__ = ["BENCHMARK_VERSION", "CASES", "UMBRELLA_EQUIVALENTS", "BenchCase", "all_tags"]

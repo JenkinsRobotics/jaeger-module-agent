@@ -759,4 +759,10 @@ def all_tags() -> set[str]:
     return out
 
 
-__all__ = ["BenchCase", "CASES", "UMBRELLA_EQUIVALENTS", "all_tags"]
+__all__ = [
+    "BENCHMARK_VERSION",
+    "BenchCase",
+    "CASES",
+    "UMBRELLA_EQUIVALENTS",
+    "all_tags",
+]

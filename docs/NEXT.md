@@ -91,7 +91,7 @@ Already inverted, as worked examples:
 | instance shapes | `instance.Layout` Protocol, structural | `1.0.6` |
 
 Remaining clusters after items 1–3: `instance.schemas` stragglers,
-`trace.py`, `bus_confirm.py`.
+`core/trace.py`, `bus_confirm.py`.
 
 ---
 
@@ -118,7 +118,7 @@ skill registry.
   `delegate_task`. All host-provided, so this cannot fail. It matters
   because `use_skill` *warns* the model when a skill's tools are missing,
   and a skill that always warns is one the model always avoids. Surfaced
-  by `python3 -m jaeger_agent.selfcheck`.
+  by `python3 -m jaeger_agent selfcheck`.
 - **`duckduckgo_search`** is the only import the self-check still lists
   besides `jaeger_ai`. It is the legacy backend behind `ddgs`; drop it
   when the fallback chain no longer needs it.
@@ -131,7 +131,7 @@ skill registry.
 ## Verifying before and after any of the above
 
 ```bash
-python3 -m jaeger_agent.selfcheck      # 19 checks, no model, under a second
+python3 -m jaeger_agent selfcheck      # 19 checks, no model, under a second
 python3 -m pytest -q                   # 418
 ruff check <changed files>             # CI lints changed files only
 ```

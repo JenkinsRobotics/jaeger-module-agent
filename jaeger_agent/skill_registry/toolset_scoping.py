@@ -336,6 +336,17 @@ def tool_visible(name: str) -> bool:
     scoping OFF (the default), every tool is visible."""
     if not _scoping_enabled():
         return True
+    return scoped_tool_visible(name)
+
+
+def scoped_tool_visible(name: str) -> bool:
+    """Apply the lean visibility rule regardless of the process env.
+
+    Hosts with one context-tight face (for example a 32K multimodal UI) can
+    opt that agent into dynamic tool loading without changing the catalogue
+    seen by the host's ordinary chat sessions.  ``load_tools`` still widens
+    the same registered catalogue; only schema visibility is forced on.
+    """
     if name in CORE:
         return True
     for ts in _active:

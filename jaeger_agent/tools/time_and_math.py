@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import ast
 import datetime as dt
+import math
 import operator as op
 import os
 import platform
 import shutil
 from typing import Any
 
-from jaeger_agent.workspace import _require_layout
+from jaeger_agent.core.workspace import _require_layout
 from jaeger_os.core.safety.permissions import PermissionTier, requires_tier
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 
@@ -71,7 +72,6 @@ _CALC_CMP: dict[type, Any] = {
 # the calculator can't handle `sqrt(...)`. abs / log / log10 / exp / sin / cos
 # / tan are cheap to include and round out the surface a model is likely to
 # try without unlocking anything dangerous.
-import math
 _CALC_FUNCS: dict[str, Any] = {
     "sqrt": math.sqrt, "abs": abs, "log": math.log, "log10": math.log10,
     "exp": math.exp, "sin": math.sin, "cos": math.cos, "tan": math.tan,

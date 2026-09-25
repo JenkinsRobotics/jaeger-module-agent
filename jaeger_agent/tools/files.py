@@ -26,13 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
-from jaeger_agent.workspace import (
+from jaeger_agent.core.workspace import (
     SandboxError,
     _audit,
     _display_path,
     _require_layout,
     _resolve_read,
-    _resolve_under,
     _resolve_write,
     git_autocommit,
 )

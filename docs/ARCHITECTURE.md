@@ -105,7 +105,7 @@ coined in the source are kept as-is rather than re-branded.
 | **The Split-Context Persona Pipeline** | *Name-in, voice-out*: identity name at the start, character only at the end, vanilla worker in between | `prompts/assemble.py` + `persona_filter.py` | §6 |
 | **The Character Block Channel** | The opaque `character_block` string — the one seam an app pours its character through | `prompts/persona_filter.py` | §6 |
 | **The Host Contribution Path** | A host's tools, toolsets and skills are equal to the module's | `skill_registry/toolset_scoping.py` | §3 |
-| **The Self-Check** | 19 model-free assertions on the surface — `python3 -m jaeger_agent.selfcheck` | `selfcheck.py` | §9 |
+| **The Self-Check** | 19 model-free assertions on the surface — `python3 -m jaeger_agent selfcheck` | `core/selfcheck.py` | §9 |
 | **The Boundary Ratchet** | App-import budget that can only fall | `tests/test_module_boundary.py` | §7 |
 | **Persona Mode C — The Id/Ego Lane** | Optional lane where the character speaks first and reaches the agent through exactly one `perform_task` tool | `prompts/persona_lane.py` | §6 |
 | **The Content Survival Gate** | Restyled never means replaced — facts, numbers, paths must survive verbatim | `prompts/persona_filter.py` | §6 |
@@ -120,7 +120,7 @@ coined in the source are kept as-is rather than re-branded.
 | **The Playbook Skill Corpus** | 107 `SKILL.md` recipes loaded on demand via `use_skill` | `skills/` | §4 |
 | **The Skill Enum Gate** | `use_skill`'s `name` is a generated enum, so a skill that does not exist cannot be named | `tools/skills.py` | §4 |
 | **The Live Tool Registry Read** | The registry is re-read every turn, so anything that registers becomes reachable without this package knowing it exists | `loop/jaeger_agent.py` | §3 |
-| **The Layout Bind Seam** | `workspace.bind(layout)` — host-injected instance root for all tool I/O | `workspace.py` | §7 |
+| **The Layout Bind Seam** | `workspace.bind(layout)` — host-injected instance root for all tool I/O | `core/workspace.py` | §7 |
 
 ---
 
@@ -134,7 +134,7 @@ ChatMessage (/act/chat) or Transcript (/sense/stt/transcript)
       │  AgentBridge._on_chat / _on_transcript → inbox queue
       │  (turn already live? steer() it instead of queueing)
       ▼
-AgentBridge._loop  (worker thread)          jaeger_agent/bridge.py
+AgentBridge._loop  (worker thread)          jaeger_agent/core/bridge.py
   publish AgentState "thinking"  → /sense/agent_state
       │
   drive_one_turn(agent, text)               loop/runtime_bridge.py
@@ -244,7 +244,7 @@ Every tool declares a `side_effect`. Write-tier tools are gated, and the
 gates fail *closed* — a tool whose owning module is absent reports
 unavailable rather than falling through to an optimistic default. That
 fail-open regression happened once, in the plugin era, and the current
-`_TOOL_TO_MODULE` / `_TOOL_TO_SLOT` split in `availability.py` exists to
+`_TOOL_TO_MODULE` / `_TOOL_TO_SLOT` split in `core/availability.py` exists to
 prevent its return.
 
 ---
@@ -468,31 +468,25 @@ string, because the alternative is running the turn twice.
 
 Where the boundary holds:
 
-- **Zero** imports of sibling modules. No `jaeger_kokoro_tts`, no
-  `jaeger_whisper_stt`, anywhere in package code. TTS and STT are reached
-  as *slots and topics*, never as packages.
+- Neural input/output dependencies remain lazy and optional. The reusable
+  multimodal engine owns its node runtimes; importing `jaeger_agent` does not
+  import pyaec, Kokoro, or pywhispercpp.
 - The instance layout is **injected**, not fetched: `workspace.bind(layout)`
   wires all tool I/O to a host-chosen directory at startup, and the
   `InstanceLayout` type import is `TYPE_CHECKING` only.
-- The whole 375-test suite passes with **no host application installed**.
+- The package's full suite and self-check run without booting a host
+  application.
 
-Where it does not, as of `1.0.1`:
+Remaining host-extension seams:
 
-- **54 imports of `jaeger_ai`** across ~24 files in package code, spanning
-  18 distinct app modules. Heaviest: instance schemas (9), `jaeger_ai.main`
-  (8), instance layout (7), usage stats (4), plugins (4). Not all want the
-  same remedy: the instance and pipeline ones want a seam, while
-  `tools/persona.py`'s six want the *tools themselves* to move back to the
-  application (§6).
-- **42 undeclared third-party imports** in package code — `numpy`, `yaml`,
-  `requests`, `certifi`, `torch`, `pydantic` — against a `pyproject.toml`
-  declaring only `jaeger-os`, `llama-cpp-python`, `jinja2`.
-- The benchmark corpus lives in the application, so `tools/bench.py` — an
-  agent-callable "run the system benchmark" tool — hard-fails without it.
-
-The suite passing without the app while 54 such imports exist means those
-paths are simply untested. The package *imports* standalone; it does not
-yet *run* standalone, and `pyproject.toml` currently claims otherwise.
+- Some optional product integrations still late-import JaegerAI when that host
+  is installed: persona/plugin bridges, application telemetry, and a few
+  desktop tools. They are not imported by package startup or the multimodal
+  engine. Each remains listed in `core/host.py` until replaced by an injected
+  host contribution or moved back to the application.
+- Host-specific tools can therefore degrade when the corresponding host hook
+  is absent. The core loop, local runtime, memory, standard tools, skills, and
+  multimodal runner operate standalone.
 
 **The direction of the fix is the interesting part.** Embedded in Mochi,
 it is Mochi's character that applies, not JaegerAI's — so the agent cannot
@@ -508,7 +502,7 @@ filled by whichever application is hosting.
 
 Two things, deliberately separate.
 
-**The Self-Check** — `python3 -m jaeger_agent.selfcheck [--json]`. 19
+**The Self-Check** — `python3 -m jaeger_agent selfcheck [--json]`. 19
 assertions, under a second, no model and no host. It catches what only
 surfaces mid-turn: a schema that will not serialise, a duplicate or
 wire-unsafe tool name, a toolset naming a tool nothing provides, a skill

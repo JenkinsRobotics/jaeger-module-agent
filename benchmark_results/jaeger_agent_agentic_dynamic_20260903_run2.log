@@ -1,0 +1,1338 @@
+[jaeger-skills] 2 skill(s) provide tools (registered): computer_use@1.0.0(core), macos_computer@1.0.0(core)
+[jaeger-skills] 107 skill(s) provide a recipe (loadable via use_skill).
+[jaeger-skills] agentic surface: 107 tools · 2 tool-providing skill(s) · 107 recipe skill(s).
+[gemma-multimodal] loading vision projector mmproj-gemma-4-E4B-it-BF16.gguf…
+[gemma-multimodal] using injected AgentRuntime (runtime-owned conversation memory)
+[gemma-multimodal] warming AgentRuntime brain…
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+ready<turn|>
+<|turn>model
+
+[gemma-multimodal] loading Kokoro…
+/Users/jonathanjenkins/GITHUB/VoiceLLM-Playground/.venv/lib/python3.11/site-packages/torch/nn/modules/rnn.py:1011: UserWarning: dropout option adds dropout after all but last recurrent layer, so non-zero dropout expects num_layers greater than 1, but got dropout=0.2 and num_layers=1
+  super().__init__("LSTM", *args, **kwargs)
+/Users/jonathanjenkins/GITHUB/VoiceLLM-Playground/.venv/lib/python3.11/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+WARNING: Defaulting repo_id to hexgrad/Kokoro-82M. Pass repo_id='hexgrad/Kokoro-82M' to suppress this warning.
+[gemma-multimodal] loading Whisper large-v3-turbo…
+whisper_init_from_file_with_params_no_state: loading model from '/Users/jonathanjenkins/Library/Application Support/pywhispercpp/models/ggml-large-v3-turbo.bin'
+whisper_init_with_params_no_state: use gpu    = 1
+whisper_init_with_params_no_state: flash attn = 1
+whisper_init_with_params_no_state: gpu_device = 0
+whisper_init_with_params_no_state: dtw        = 0
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_init: loaded in 0.006 sec
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple7  (1007)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 26800.60 MB
+whisper_init_with_params_no_state: devices    = 3
+whisper_init_with_params_no_state: backends   = 3
+whisper_model_load: loading model
+whisper_model_load: n_vocab       = 51866
+whisper_model_load: n_audio_ctx   = 1500
+whisper_model_load: n_audio_state = 1280
+whisper_model_load: n_audio_head  = 20
+whisper_model_load: n_audio_layer = 32
+whisper_model_load: n_text_ctx    = 448
+whisper_model_load: n_text_state  = 1280
+whisper_model_load: n_text_head   = 20
+whisper_model_load: n_text_layer  = 4
+whisper_model_load: n_mels        = 128
+whisper_model_load: ftype         = 1
+whisper_model_load: qntvr         = 0
+whisper_model_load: type          = 5 (large v3)
+whisper_model_load: adding 1609 extra tokens
+whisper_model_load: n_langs       = 100
+whisper_model_load:         MTL0 total size =  1623.92 MB
+whisper_model_load: model size    = 1623.92 MB
+whisper_backend_init_gpu: device 0: MTL0 (type: 1)
+whisper_backend_init_gpu: found GPU device 0: MTL0 (type: 1, cnt: 0)
+whisper_backend_init_gpu: using MTL0 backend
+ggml_metal_init: allocating
+ggml_metal_init: found device: Apple M1 Max
+ggml_metal_init: picking default device: Apple M1 Max
+ggml_metal_init: use fusion         = true
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+whisper_backend_init: using BLAS backend
+whisper_init_state: kv self size  =   10.49 MB
+whisper_init_state: kv cross size =   31.46 MB
+whisper_init_state: kv pad  size  =    7.86 MB
+whisper_init_state: compute buffer (conv)   =   37.69 MB
+whisper_init_state: compute buffer (encode) =   67.31 MB
+whisper_init_state: compute buffer (cross)  =   63.03 MB
+whisper_init_state: compute buffer (decode) =  100.04 MB
+[gemma-multimodal] primed in 18493 ms
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+What is 17 plus 28? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_math                         8100 ms  Forty-five.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+What is the capital of Japan? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_fact                         8118 ms  The capital of Japan is Tokyo.
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+What number comes next: 2, 4, 8, 16? Answer briefly.<turn|>
+<|turn>model
+
+  DONE  text_sequence                     8489 ms  The next number in the sequence is 32, as each number is doubled to ge
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+Reply with exactly these two words and nothing else: amber comet<turn|>
+<|turn>model
+
+  DONE  text_instruction                  7991 ms  amber comet
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+Remember these two facts for later: my project codename is Violet and its build number is 731. Reply only: remembered.<turn|>
+<|turn>model
+
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+Remember these two facts for later: my project codename is Violet and its build number is 731. Reply only: remembered.<turn|>
+<|turn>model
+<|tool_call>call:memory{action:<|"|>remember<|"|>,key:<|"|>project codename<|"|>,value:<|"|>Violet<|"|>}<tool_call|><|tool_call>call:memory{action:<|"|>remember<|"|>,key:<|"|>build number<|"|>,value:<|"|>731<|"|>}<tool_call|><turn|>
+<|turn>tool
+{"ok": true, "remembered": true, "key": "project codename", "value": "Violet", "subject": "user", "category": "general"}<turn|>
+<|turn>tool
+{"ok": true, "remembered": true, "key": "build number", "value": "731", "subject": "user", "category": "general"}<turn|>
+<|turn>model
+
+add_text: <|turn>system
+You are a helpful voice assistant. Answer in 1–2 short sentences in plain conversational English. No markdown, no code blocks, no emojis, no lists. If you don't know, say so briefly.
+
+# Dynamic output routing
+This face can emit text, speech, or both. You choose per turn:
+- Each user turn begins with `[input: text]` or `[input: speech]`; use it as
+  context when choosing the most natural response channel.
+- Begin the final response with exactly one directive: `[OUTPUT:TEXT]`,
+  `[OUTPUT:SPEECH]`, `[OUTPUT:BOTH]`, or `[OUTPUT:SILENT]`.
+- Put the response after the directive. SILENT has no response body.
+- Do not call `text_to_speech` for final user-facing speech. That external
+  narration tool is intentionally unavailable in this multimodal face.
+Choose naturally from the request, conversational context, and input modality.
+The harness removes the directive and routes the content through its own output
+nodes. These rules override the base text-only/default-TTS guidance.<|tool>declaration:write_file{description:<|"|>Write a text file in the sandboxed skills/ directory. Overwrites
+if it already exists.<|"|>,parameters:{properties:{content:{type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>content<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:read_file{description:<|"|>Read a text file from ANYWHERE on the machine — your own
+source code, the whole repository you run from, the wider
+system. Absolute paths and `~` work; reading is not sandboxed.
+(Off-limits: the credentials/ store and OS secret files like
+~/.ssh.) For a large file, page it: `offset` is the 0-based
+first line, `limit` the line count (default: the whole file).<|"|>,parameters:{properties:{limit:{nullable:true,type:<|"|>INTEGER<|"|>},offset:{type:<|"|>INTEGER<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:get_time{description:<|"|>The current date, day of the week, year, and time — the ONLY
+source of truth for "what day/date/year/time is it", "what's
+today", and similar. Your training data is frozen in the past, so
+a date or year answered from memory will be WRONG — always call
+this for anything about the present moment. Optional IANA
+timezone (e.g. 'Asia/Shanghai').<|"|>,parameters:{properties:{timezone:{nullable:true,type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:calculate{description:<|"|>Evaluate a safe arithmetic expression. Supports + - * / ** % //
+and single-arg sqrt/abs/log/log10/exp/sin/cos/tan/floor/ceil/round.
+For "square root of N" call calculate("sqrt(N)").<|"|>,parameters:{properties:{expression:{type:<|"|>STRING<|"|>}},required:[<|"|>expression<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:describe_tool{description:<|"|>Show the FULL schema + registry metadata for one tool — even
+one that's not currently in the agent's visible toolset. Use this
+when you see a tool name in the catalog and want to know exactly
+what arguments it takes (or what its permission tier / availability
+constraints are) BEFORE deciding to use it.
+
+Returns:
+  * ``name`` / ``description`` / ``parameters`` — the same schema
+    the model would see in its tools list
+  * ``toolset`` — the category the tool belongs to (``"core"``,
+    ``"files"``, ``"computer_use"``, etc.) so you know which
+    ``load_tools`` call would bring its siblings in
+  * ``permission_tier`` — ``READ_ONLY`` / ``WRITE_LOCAL`` /
+    ``EXTERNAL_EFFECT`` / ``HARDWARE`` / ``PRIVILEGED``. Tells you
+    whether calling it will need user confirmation.
+  * ``side_effect`` — coarser hint: ``read`` / ``write`` /
+    ``external`` / ``hardware``.
+  * ``available`` — False when a runtime precondition fails
+    (missing deps, missing env var). The tool is still registered
+    but calling it would fail; you'd need to install / configure
+    first.
+  * ``requires_env`` — env-var names the tool needs at runtime
+    (e.g. ``["OPENAI_API_KEY"]``).
+  * ``max_result_chars`` — per-tool result size cap (0 = use the
+    global default).
+  * ``examples`` — short example call shapes, when authored.
+
+``{ok: False, error}`` for an unknown name.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:load_tools{description:<|"|>Make a group of extra tools visible. You start each turn with
+a small CORE toolset; everything else is grouped — built-in
+classes (``files``, ``code``, ``media``, …) and skills (each skill
+is its own toolset of curated tools).
+
+Call this the MOMENT a task needs a capability you don't see a
+tool for — BEFORE concluding you can't do it. The new tools appear
+on your very next step. Call with no name (or an unknown one) to
+get the catalog of every toolset and what it holds. Returns the
+toolsets now active.
+
+No-op when ``JAEGER_TOOLSET_SCOPING`` is off (the 0.1.0 default) —
+every tool is already visible. The active-set tracking still works
+so this is harmless to call regardless of the scoping mode.<|"|>,parameters:{properties:{name:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_tools{description:<|"|>Find a SPECIFIC tool by keyword when the exact tool a task needs isn't in
+your current view — e.g. ``list_tools("weather")`` → ``get_weather`` in the
+``web`` toolset; then ``load_tools("web")`` to use it. It returns matching
+tool names + their toolset, NOT a description of your capabilities — for
+"what can you do / help" use ``help_me``, not this. When every tool is
+already visible you rarely need it. Optional ``query`` filters by substring.<|"|>,parameters:{properties:{query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:recall{description:<|"|>MANDATORY when the user asks about something they told you
+earlier ("what did I say my…", "do you remember…", "what's my
+favorite X"). Call BEFORE answering — the persisted store is the
+source of truth. `subject` scopes whose fact (omit for the operator,
+or "alice" for someone else). Fuzzy match supported. For how a fact
+CHANGED over time, use `memory(action="history", …)`.<|"|>,parameters:{properties:{key:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>}},required:[<|"|>key<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:memory{description:<|"|>The agent's persistent SQL memory — one tool, action-dispatched.
+``action`` ∈ remember / recall / history / forget / list / search.
+``remember`` takes key+value (+ optional subject/category/tags/note);
+``recall`` / ``history`` / ``forget`` take key (+ optional subject);
+``search`` takes query. ``subject`` = who the fact is about (omit for
+the operator). ``history`` returns a fact's values over time. See
+``describe_tool("memory")`` for the full when-to-call contract.<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},category:{type:<|"|>STRING<|"|>},key:{type:<|"|>STRING<|"|>},note:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>},subject:{type:<|"|>STRING<|"|>},tags:{type:<|"|>STRING<|"|>},value:{type:<|"|>STRING<|"|>}},required:[<|"|>action<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_search{description:<|"|>Web search (multi-backend, no API key). Returns titles + URLs
++ snippets. Use this to FIND relevant pages, then web_extract to
+actually READ one.<|"|>,parameters:{properties:{max_results:{type:<|"|>INTEGER<|"|>},query:{type:<|"|>STRING<|"|>}},required:[<|"|>query<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:web_extract{description:<|"|>Fetch a web page and return its readable text. This is the
+research tool — web_search finds which pages matter, web_extract
+reads one. Use it to pull library docs, API references, Stack
+Overflow answers, READMEs — anything you need to understand
+before writing code for an unfamiliar task.<|"|>,parameters:{properties:{max_chars:{type:<|"|>INTEGER<|"|>},url:{type:<|"|>STRING<|"|>}},required:[<|"|>url<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:execute_code{description:<|"|>Run Python code and return its output. Reach for this for
+computational work: arithmetic that can't be done with
+`calculate`, string transforms, quick logic — and to run files
+you wrote with write_file (code runs IN the skills/ workspace,
+so `import name` and `open('file')` see them). To run a file you
+wrote, pass Python (e.g. code="import fib10" or
+open('fib10.py').read()) — NOT a shell line like
+"python fib10.py", which is not valid Python. 10s default
+timeout. Isolated from packages installed via install_package.
+
+For the current date / day / time / timezone, use `get_time` —
+it's the ONLY source of truth, not Python's clock.<|"|>,parameters:{properties:{code:{type:<|"|>STRING<|"|>},timeout_s:{type:<|"|>NUMBER<|"|>}},required:[<|"|>code<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:help_me{description:<|"|>Capability summary — call when the user asks 'what can you do?'.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_view{description:<|"|>Read the kanban task board — what work is queued (ready),
+in_progress, blocked, or done. Optionally filter by `column` or
+`tag`. Deep Think jobs show here too (tag 'deepthink').<|"|>,parameters:{properties:{column:{type:<|"|>STRING<|"|>},tag:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:board_add{description:<|"|>Add a card to the kanban board (lands in `ready`, set to
+work). Use this to lay out a multi-step task as cards so you and
+the user can track progress. `priority` is low/med/high.
+`kind="deepthink"` files it for the Deep Think coder model (lands
+in `backlog` for the user to approve) — but for a genuine hard
+build/fix, prefer `propose_deep_think_task`.<|"|>,parameters:{properties:{kind:{type:<|"|>STRING<|"|>},priority:{type:<|"|>STRING<|"|>},tags:{nullable:true,items:{type:<|"|>STRING<|"|>},type:<|"|>ARRAY<|"|>},title:{type:<|"|>STRING<|"|>}},required:[<|"|>title<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:list_skills{description:<|"|>LIST, SEARCH, and read your playbook skills — the skill-library
+lookup (the read-only counterpart to ``use_skill``, which loads ONE
+recipe to follow). ``action`` selects the operation:
+
+  - ``list``   — the FULL catalog of available skills (the default).
+    Call it when STARTING a non-trivial task to see what exists.
+  - ``search`` — skills matching ``query`` (name/description/tags).
+  - ``view``   — the full instructions of skill ``name`` (+ its
+    bundled files; pass ``file="references/x.md"`` to read one).
+  - ``curate`` — audit the library for STALE / unused skills.
+  - ``stats``  — which skills/tools get used most.
+
+Does NOT create or edit skills (that's ``write_file`` + the
+skill-builder recipe). Read-only. Reach for it whenever a task is
+specialized ("inspect a codebase", "search arxiv", "check for stale
+skills").<|"|>,parameters:{properties:{action:{type:<|"|>STRING<|"|>},file:{type:<|"|>STRING<|"|>},name:{type:<|"|>STRING<|"|>},query:{type:<|"|>STRING<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:use_skill{description:<|"|>Load a specialized JROS playbook recipe and FOLLOW it. Call this BEFORE raw tools for any specialized task (research, codebase analysis, creative output, an app/service, macOS/desktop automation) — first scan your skills for a match; only if NONE fits do you reach for raw tools. Returns the playbook's step-by-step recipe; execute it with your normal tools. `name` must be one of the available skills.<|"|>,parameters:{properties:{name:{enum:[<|"|>apple-notes<|"|>,<|"|>apple-reminders<|"|>,<|"|>findmy<|"|>,<|"|>imessage<|"|>,<|"|>mac-native<|"|>,<|"|>macos-computer-use<|"|>,<|"|>claude-code<|"|>,<|"|>codex<|"|>,<|"|>deep-think<|"|>,<|"|>hermes-agent<|"|>,<|"|>opencode<|"|>,<|"|>ai-image-gen<|"|>,<|"|>architecture-diagram<|"|>,<|"|>ascii-art<|"|>,<|"|>ascii-video<|"|>,<|"|>baoyu-comic<|"|>,<|"|>baoyu-infographic<|"|>,<|"|>claude-design<|"|>,<|"|>comfyui<|"|>,<|"|>design-md<|"|>,<|"|>excalidraw<|"|>,<|"|>humanizer<|"|>,<|"|>ideation<|"|>,<|"|>manim-video<|"|>,<|"|>meme-generation<|"|>,<|"|>p5js<|"|>,<|"|>pixel-art<|"|>,<|"|>popular-web-designs<|"|>,<|"|>pretext<|"|>,<|"|>sketch<|"|>,<|"|>songwriting-and-ai-music<|"|>,<|"|>touchdesigner-mcp<|"|>,<|"|>jupyter-live-kernel<|"|>,<|"|>log-calculations<|"|>,<|"|>docker-management<|"|>,<|"|>kanban-orchestrator<|"|>,<|"|>kanban-worker<|"|>,<|"|>process-monitoring<|"|>,<|"|>webhook-subscriptions<|"|>,<|"|>email-triage<|"|>,<|"|>himalaya<|"|>,<|"|>minecraft-modpack-server<|"|>,<|"|>pokemon-player<|"|>,<|"|>computer_use<|"|>,<|"|>macos_computer<|"|>,<|"|>web-app-qa<|"|>,<|"|>yuanbao<|"|>,<|"|>codebase-inspection<|"|>,<|"|>github-auth<|"|>,<|"|>github-code-review<|"|>,<|"|>github-issues<|"|>,<|"|>github-pr-workflow<|"|>,<|"|>github-repo-management<|"|>,<|"|>native-mcp<|"|>,<|"|>gif-search<|"|>,<|"|>heartmula<|"|>,<|"|>songsee<|"|>,<|"|>spotify<|"|>,<|"|>youtube-content<|"|>,<|"|>messaging_setup<|"|>,<|"|>audiocraft-audio-generation<|"|>,<|"|>dspy<|"|>,<|"|>evaluating-llms-harness<|"|>,<|"|>huggingface-hub<|"|>,<|"|>llama-cpp<|"|>,<|"|>obliteratus<|"|>,<|"|>segment-anything-model<|"|>,<|"|>serving-llms-vllm<|"|>,<|"|>weights-and-biases<|"|>,<|"|>obsidian<|"|>,<|"|>airtable<|"|>,<|"|>excel-author<|"|>,<|"|>file-organization<|"|>,<|"|>google-workspace<|"|>,<|"|>kanban<|"|>,<|"|>linear<|"|>,<|"|>maps<|"|>,<|"|>memory-keeping<|"|>,<|"|>nano-pdf<|"|>,<|"|>notion<|"|>,<|"|>ocr-and-documents<|"|>,<|"|>powerpoint<|"|>,<|"|>scheduling<|"|>,<|"|>teams-meeting-pipeline<|"|>,<|"|>godmode<|"|>,<|"|>arxiv<|"|>,<|"|>blogwatcher<|"|>,<|"|>llm-wiki<|"|>,<|"|>polymarket<|"|>,<|"|>research-paper-writing<|"|>,<|"|>web-research<|"|>,<|"|>home-assistant<|"|>,<|"|>openhue<|"|>,<|"|>xurl<|"|>,<|"|>debugging-hermes-tui-commands<|"|>,<|"|>hermes-agent-skill-authoring<|"|>,<|"|>node-inspect-debugger<|"|>,<|"|>plan<|"|>,<|"|>python-debugpy<|"|>,<|"|>requesting-code-review<|"|>,<|"|>self-improvement<|"|>,<|"|>skill-builder<|"|>,<|"|>spike<|"|>,<|"|>subagent-driven-development<|"|>,<|"|>systematic-debugging<|"|>,<|"|>test-driven-development<|"|>,<|"|>writing-plans<|"|>],type:<|"|>STRING<|"|>}},required:[<|"|>name<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:todo{description:<|"|>Session task list — a scratchpad for multi-step jobs (3+
+steps or several things at once). No args = read current
+list. ``todos`` = list of ``{id, content, status}`` items
+(pending / in_progress / completed / cancelled). ``merge=False``
+(default) replaces the list; ``merge=True`` updates by id.
+
+Keep exactly ONE item in_progress at a time; use the kanban
+board for cross-session work. See ``describe_tool("todo")``
+for the full contract.<|"|>,parameters:{properties:{merge:{type:<|"|>BOOLEAN<|"|>},todos:{nullable:true,items:{additionalProperties:true,properties:{},type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_do{description:<|"|>Run a plan (string or list of action dicts) through the
+AppleScript → browser → AX → vision capability ladder.
+Picks the fastest available engine per step. Tier-2.
+
+NOT for a plain system-setting toggle this ladder has no
+AppleScript entry for (dark mode, volume, brightness, do-not-
+disturb, keep-awake) — use `system_control(action=...)`
+instead; it's a dedicated, faster, more reliable call for
+exactly those and this ladder would otherwise fall through to
+the slow AX/vision rungs trying to click a Settings toggle.<|"|>,parameters:{properties:{goal:{type:<|"|><|"|>}},required:[<|"|>goal<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:computer_look{description:<|"|>Read-only snapshot — running apps + the focused window
+(title / position / size / shallow child summary).
+``app=...`` returns the focused window OF THAT APP;
+``include_screenshot=True`` adds a one-shot PNG path. Read-
+only, no clicks.<|"|>,parameters:{properties:{app:{type:<|"|>STRING<|"|>},include_screenshot:{type:<|"|>BOOLEAN<|"|>}},type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+[input: text]
+Remember these two facts for later: my project codename is Violet and its build number is 731. Reply only: remembered.<turn|>
+<|turn>model
+<|tool_call>call:memory{action:<|"|>remember<|"|>,key:<|"|>project codename<|"|>,value:<|"|>Violet<|"|>}<tool_call|><|tool_call>call:memory{action:<|"|>remember<|"|>,key:<|"|>build number<|"|>,value:<|"|>731<|"|>}<tool_call|><turn|>
+<|turn>tool
+{"ok": true, "remembered": true, "key": "project codename", "value": "Violet", "subject": "user", "category": "general"}<turn|>
+<|turn>tool
+{"ok": true, "remembered": true, "key": "build number", "value": "731", "subject": "user", "category": "general"}<turn|>
+<|turn>model
+remembered<turn|>
+<|turn>user
+[input: text]
+What project codename and build number did I ask you to remember?<turn|>
+<|turn>model
+
+Traceback (most recent call last):
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/loop/jaeger_agent.py", line 1438, in _dispatch_parallel
+    contents[i] = fut.result()
+                  ^^^^^^^^^^^^
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/concurrent/futures/_base.py", line 451, in result
+    self._condition.wait(timeout)
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/threading.py", line 327, in wait
+    waiter.acquire()
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/scripts/benchmark_multimodal_candidate.py", line 291, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/scripts/benchmark_multimodal_candidate.py", line 283, in main
+    result = run(args)
+             ^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/scripts/benchmark_multimodal_candidate.py", line 187, in run
+    engine.send_text(case["prompt"])
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/engine.py", line 458, in send_text
+    self._respond(text, input_modality="text")
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/engine.py", line 631, in _respond
+    self._respond_locked(command, t_end, turns, input_modality=input_modality)
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/engine.py", line 654, in _respond_locked
+    reply = self._answer(user_text, image)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/engine.py", line 704, in _answer
+    return self.node_llm.answer(content, system)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/engine.py", line 164, in answer
+    value = multimodal(
+            ^^^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/core/runtime.py", line 350, in run_multimodal_turn
+    return TurnResult(text=agent.run_turn(text, content=content))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/loop/jaeger_agent.py", line 418, in run_turn
+    return self._run_turn_inner(user_message)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/loop/jaeger_agent.py", line 623, in _run_turn_inner
+    self._dispatch_parallel(tool_calls)
+  File "/Users/jonathanjenkins/GITHUB/jaeger-agent/jaeger_agent/loop/jaeger_agent.py", line 1428, in _dispatch_parallel
+    with ThreadPoolExecutor(
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/concurrent/futures/_base.py", line 647, in __exit__
+    self.shutdown(wait=True)
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/concurrent/futures/thread.py", line 235, in shutdown
+    t.join()
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/threading.py", line 1119, in join
+    self._wait_for_tstate_lock()
+  File "/Users/jonathanjenkins/.pyenv/versions/3.11.9/lib/python3.11/threading.py", line 1139, in _wait_for_tstate_lock
+    if lock.acquire(block, timeout):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt

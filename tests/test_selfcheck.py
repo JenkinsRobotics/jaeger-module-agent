@@ -15,15 +15,12 @@ from __future__ import annotations
 
 import pytest
 
-from jaeger_agent import selfcheck
+from jaeger_agent.core import selfcheck
 
 
 @pytest.fixture(autouse=True)
-def _live_surface():
+def _live_surface(live_tools):
     """Every check here reads the real registry — see tests/conftest.py."""
-    from tests.conftest import _register_tool_surface
-
-    _register_tool_surface()
     yield
 
 
@@ -59,7 +56,7 @@ def test_a_broken_check_is_reported_not_raised() -> None:
 
 
 def test_exit_code_follows_health() -> None:
-    """``python3 -m jaeger_agent.selfcheck`` is meant for CI, so the exit
+    """``python3 -m jaeger_agent selfcheck`` is meant for CI, so the exit
     code has to mean something."""
     assert selfcheck.main([]) == 0
 
@@ -79,7 +76,7 @@ def test_json_output_is_machine_readable(capsys) -> None:
 def test_usage_counts_in_memory_without_a_host() -> None:
     """The point of the inversion: an embedder that is not JaegerAI still
     gets working counters, where before it got none."""
-    from jaeger_agent import usage
+    from jaeger_agent.core import usage
 
     usage.set_sink(None)
     usage.reset()
@@ -96,7 +93,7 @@ def test_usage_counts_in_memory_without_a_host() -> None:
 
 def test_a_registered_sink_wins_for_reads() -> None:
     """A host with persisted history should beat this process's slice."""
-    from jaeger_agent import usage
+    from jaeger_agent.core import usage
 
     class Sink:
         def top_tools(self, limit):
@@ -115,7 +112,7 @@ def test_a_registered_sink_wins_for_reads() -> None:
 def test_a_raising_sink_never_breaks_a_turn() -> None:
     """Telemetry is best-effort. A broken host backend must degrade to the
     in-memory counters, not take down the tool call being counted."""
-    from jaeger_agent import usage
+    from jaeger_agent.core import usage
 
     class Bad:
         def record_tool(self, *a, **k):

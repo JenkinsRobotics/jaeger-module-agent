@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from jaeger_agent.workspace import _require_layout
+from jaeger_agent.core.workspace import _require_layout
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 
 _LAYERS = ("hexaco", "special", "expression", "domains")
 
 
 def _active() -> Any:
-    from jaeger_ai.personality.character import active_character
+    from jaeger_ai.characters.character import active_character
     try:
         return active_character(_require_layout().root)
     except Exception:  # noqa: BLE001
@@ -30,7 +30,7 @@ def read_traits() -> dict[str, Any]:
     c = _active()
     if c is None:
         return {"ok": False, "error": "no active character selected"}
-    from jaeger_ai.personality.character import layer_items
+    from jaeger_ai.characters.character import layer_items
     p = c.personality
     return {"ok": True, "character": c.name,
             **{k: dict(layer_items(getattr(p, k))) for k in _LAYERS}}
@@ -48,7 +48,7 @@ def adjust_trait(layer: str, field: str, value: float) -> dict[str, Any]:
     layer = (layer or "").lower().strip()
     if layer not in _LAYERS:
         return {"ok": False, "error": f"unknown layer {layer!r}; one of {list(_LAYERS)}"}
-    from jaeger_ai.personality.character import layer_items, save_character_traits
+    from jaeger_ai.characters.character import layer_items, save_character_traits
     cur = dict(layer_items(getattr(c.personality, layer)))
     if field not in cur:
         return {"ok": False, "error": f"unknown {layer} trait {field!r}; options: {sorted(cur)}"}

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pathlib
 
-from jaeger_agent import workspace
+from jaeger_agent.core import workspace
 
 
 def test_default_workspace_lands_in_the_project_not_the_home_dir(tmp_path, monkeypatch) -> None:
@@ -38,11 +38,16 @@ def test_explicit_root_wins(tmp_path) -> None:
 
 
 def test_ensure_bound_does_not_steal_a_hosts_layout(tmp_path, monkeypatch) -> None:
-    """An app that bound its own instance keeps it."""
+    """A host layout owns workspace and memory; fallback state stays unused."""
+    from jaeger_agent.memory import sqlite_store
+
     monkeypatch.chdir(tmp_path)
     host = workspace.DefaultWorkspace(tmp_path / "host_owned").create()
     workspace.bind(host)
     try:
         assert workspace.ensure_bound().root == host.root
+        assert sqlite_store.db_path() == host.memory_dir / "state.db"
+        assert not (tmp_path / ".jaeger_agent").exists()
     finally:
+        sqlite_store.close()
         workspace._layout = None

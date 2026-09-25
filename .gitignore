@@ -52,6 +52,8 @@ htmlcov/
 *.pt
 *.pth
 *.onnx
+# Small, licensed reference VAD required for first-run microphone capture.
+!jaeger_agent/assets/silero/silero_vad_16k_op15.onnx
 *.safetensors
 
 # Local secrets
