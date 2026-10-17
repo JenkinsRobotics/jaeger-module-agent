@@ -2,8 +2,8 @@
 
 JaegerAgent is the reusable, headless agent-brain module for JaegerOS.
 
-It is the piece an application or robot imports when it needs a working
-agent — not a loop you then have to furnish. A bare install brings its own
+It is the piece an application, service, or device imports when it needs a
+working agent — not a loop you then have to furnish. A bare install brings its own
 tool surface, skill corpus, prompt assembly, workspace sandbox and local
 inference. It does not own a desktop window, installer, default character,
 or complete product experience; those belong to applications such as
@@ -112,17 +112,15 @@ When an application such as JaegerAI, Mochi, or JP01 hosts JaegerAgent, the
 application injects its `InstanceLayout` with `workspace.bind(layout)`. Memory,
 tool files, logs, and artifacts then resolve under that one application-owned
 instance. For JaegerAI that canonical location is
-`JaegerAI/.jaeger_os/instances/<name>/`.
+`~/.jaeger/instances/<name>/` (or `$JAEGER_STATE_DIR/instances/<name>/`).
 
-When JaegerAgent is launched directly with no host layout, it deliberately
-falls back to `<current-directory>/.jaeger_agent/`. That directory is a
-standalone workspace, not a nested JaegerOS instance registry. Seeing both in
-adjacent development repositories therefore does not mean two live copies of
-the same deployed agent are being used.
+A standalone agent defaults to `<state root>/agent/`, where state root resolves
+`JAEGER_STATE_DIR`, then `JAEGER_HOME`, then `~/.jaeger`. Source checkouts remain
+free of runtime state. An explicit `DefaultWorkspace(root)` overrides that default.
 
 `llama-cpp-python` is a BASE dependency, not an extra, because
-`provider = "llama_cpp"` is the default — a robot that pip-installs this
-gets a brain that runs on its own hardware with no server and no account:
+`provider = "llama_cpp"` is the default — an application that installs this
+gets an agent that runs on its host with no server and no account:
 
 ```python
 from jaeger_agent.core.runtime import create_runtime
@@ -252,12 +250,6 @@ The JaegerAI `0.10` split is complete. JaegerAgent owns the reusable runtime,
 loop, provider adapters, message schemas, tool execution, context management,
 and mind module. JaegerAI consumes this package and retains only its application
 surfaces, bundled content, product configuration, and product-specific hooks.
-
-Outstanding work is tracked in [`docs/NEXT.md`](docs/NEXT.md).
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the turn pipeline,
-the tool and skill surfaces, the context guard, and the dual-lane persona
-design — plus the rule for what belongs in this module at all.
 
 See [`docs/EXTRACTION.md`](docs/EXTRACTION.md) for ownership rules and the
 ordered migration milestones.

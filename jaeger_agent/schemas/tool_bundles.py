@@ -203,7 +203,7 @@ JAEGER_TOOLSETS: dict[str, ToolsetDef] = {
             "Inspect, package, benchmark, reload skills; the usage journal "
             "+ review loop; the deep-think queue."
         ),
-        tools=_tools(_core("list_skills"), _scoping("skills")),
+        tools=_tools(_core("list_skills", "use_skill"), _scoping("skills")),
         includes=[],
     ),
     "media": ToolsetDef(
@@ -391,20 +391,6 @@ def resolve_toolsets(
     return tools
 
 
-def _runtime_toolsets() -> dict[str, frozenset[str]]:
-    """Toolsets registered while running, keyed by name.
-
-    Skills register their own membership through the loader, and a host
-    application can do the same for tools it contributes. Read through a
-    function rather than imported once, because registration happens
-    after this module is imported.
-    """
-    try:
-        from jaeger_agent.skill_registry.toolset_scoping import _SKILL_TOOLSETS
-    except Exception:  # noqa: BLE001 — no scoping module, no runtime sets
-        return {}
-    return dict(_SKILL_TOOLSETS)
-
 
 def list_toolsets() -> dict[str, dict[str, Any]]:
     """Return a copy of :data:`JAEGER_TOOLSETS` with the resolved tool
@@ -431,6 +417,7 @@ def list_toolsets() -> dict[str, dict[str, Any]]:
     return out
 
 
+
 def toolset_for_tool(tool_name: str) -> str | None:
     """Reverse lookup — return the (first) atomic toolset that owns
     ``tool_name``, or ``None`` if no atomic toolset claims it. Used by
@@ -443,6 +430,7 @@ def toolset_for_tool(tool_name: str) -> str | None:
     return None
 
 
+
 __all__ = [
     "JAEGER_TOOLSETS",
     "ToolsetDef",
@@ -450,3 +438,18 @@ __all__ = [
     "resolve_toolsets",
     "toolset_for_tool",
 ]
+
+
+def _runtime_toolsets() -> dict[str, frozenset[str]]:
+    """Toolsets registered while running, keyed by name.
+
+    Skills register their own membership through the loader, and a host
+    application can do the same for tools it contributes. Read through a
+    function rather than imported once, because registration happens
+    after this module is imported.
+    """
+    try:
+        from jaeger_agent.skill_registry.toolset_scoping import _SKILL_TOOLSETS
+    except Exception:  # noqa: BLE001 — no scoping module, no runtime sets
+        return {}
+    return dict(_SKILL_TOOLSETS)

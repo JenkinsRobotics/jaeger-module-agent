@@ -18,6 +18,7 @@ import subprocess
 from typing import Any
 
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
+from jaeger_agent.task_port import ide_request
 from jaeger_agent.tools.time_and_math import system_status
 from jaeger_agent.core.workspace import SandboxError, _require_layout, _resolve_under
 from jaeger_os.core.safety.permissions import PermissionTier, requires_tier
@@ -50,11 +51,34 @@ def open_on_host(target: str, kind: str = "auto", app: str = "") -> dict[str, An
     (``open -a <app> <url>``), e.g. "Safari"; empty = default browser.
     """
     clean = (target or "").strip()
+    app = (app or "").strip()
+    if not clean and app:
+        clean = app
+        kind = "app"
+
     if not clean:
         return {"error": "empty target"}
     kind = (kind or "auto").strip().lower()
 
+    # Well-known web destinations normalization
+    _WELL_KNOWN = {
+        "youtube": "https://www.youtube.com",
+        "google": "https://www.google.com",
+        "github": "https://github.com",
+        "reddit": "https://www.reddit.com",
+        "twitter": "https://x.com",
+        "x": "https://x.com",
+        "wikipedia": "https://www.wikipedia.org",
+    }
+    if clean.lower() in _WELL_KNOWN:
+        clean = _WELL_KNOWN[clean.lower()]
+        kind = "url"
+
     is_url = clean.startswith("http://") or clean.startswith("https://")
+    if not is_url and "." in clean and not clean.startswith("/") and " " not in clean:
+        clean = "https://" + clean
+        is_url = True
+
     if kind == "auto":
         if is_url:
             kind = "url"
@@ -69,8 +93,8 @@ def open_on_host(target: str, kind: str = "auto", app: str = "") -> dict[str, An
 
     if kind == "url":
         if not is_url:
-            return {"error": "URL must start with http:// or https://", "url": clean}
-        app = (app or "").strip()
+            clean = "https://" + clean
+            is_url = True
         if app:
             return _run_open(["-a", app, clean], {"url": clean, "app": app})
         return _run_open([clean], {"url": clean})
@@ -101,7 +125,7 @@ def _t_system_status() -> dict:
     return system_status()
 
 
-@register_tool_from_function(name="open_on_host")
+@register_tool_from_function(name="open_on_host", side_effect="external")
 @requires_tier(PermissionTier.EXTERNAL_EFFECT, skill="host",
                operation="open_on_host",
                summary="open a URL / file / app on the host")
@@ -120,16 +144,42 @@ def _t_open_on_host(target: str, kind: str = "auto", app: str = "") -> dict:
     return open_on_host(target=target, kind=kind, app=app)
 
 
+@register_tool_from_function(name="ide_context", side_effect="read")
+@requires_tier(PermissionTier.READ_ONLY, skill="ide", operation="ide_context",
+               summary="read what the operator has open in the IDE")
+def ide_context() -> dict:
+    """What the operator has open in their IDE right now: the workspace, the active
+    file, the selected lines and the other open tabs. Use it when you need the
+    current state ("this file", "what I'm looking at") mid-task."""
+    return ide_request("context")
+
+
+@register_tool_from_function(name="ide_open_file", side_effect="external")
+@requires_tier(PermissionTier.READ_ONLY, skill="ide", operation="ide_open_file",
+               summary="open a file in the operator's editor")
+def ide_open_file(path: str, line: int = 0) -> dict:
+    """Open a file in the operator's IDE editor and, if `line` is given (1-based),
+    jump to it. Relative paths are relative to the open workspace. Use it to show
+    the operator the code you are talking about or have just changed."""
+    return ide_request("open_file", {"path": str(path or ""), "line": int(line or 0)})
+
+
+@register_tool_from_function(name="ide_diagnostics", side_effect="read")
+@requires_tier(PermissionTier.READ_ONLY, skill="ide", operation="ide_diagnostics",
+               summary="read the problems the IDE shows")
+def ide_diagnostics(path: str = "") -> dict:
+    """The errors and warnings the IDE currently shows in its Problems panel
+    (type checker, linter, language server), optionally for one file. Check it
+    after an edit to see whether you introduced a problem."""
+    return ide_request("diagnostics", {"path": str(path or "")})
+
+
 @register_tool_from_function(name="set_mode")
 def _t_set_mode(mode: str) -> dict:
-    """Switch the agent's runtime mode — model + voice profile:
-      • normal — small fast model (gemma-12B) + voice (the default)
-      • high — larger model (gemma-26B), voice off; heavier reasoning
-      • deep-sleep — high model + work the Deep Think queue
-    Use when the user asks to switch ("use the bigger model", "go high
-    agentic mode", "back to normal mode"). The model swap is SLOW (~60-90s)
-    — tell the user it's switching, it's not stuck. Returns {ok, mode,
-    model, voice} or {ok:false, error}."""
+    """Switch a local in-process model/voice preset on explicit request.
+    Does not change an external provider or a Gateway session model selection.
+    Check get_mode first; inactive local presets are not the serving model.
+    Returns {ok, mode, model, voice} or {ok:false, error}."""
     from jaeger_ai.core.runtime.modes import set_mode as _set_mode
     return _set_mode(mode)
 
@@ -138,7 +188,9 @@ def _t_set_mode(mode: str) -> dict:
 def _t_get_mode() -> dict:
     """Report the agent's CURRENT runtime mode + its model/voice profile —
     use this to answer "what mode are you in?" / "which model is running?"
-    from fact, never guess. Returns {mode, model, voice, options}."""
+    from the current execution client, never a default or past conversation.
+    External clients have no active local mode. Local presets are separate,
+    inactive options. Missing execution evidence returns an unknown model."""
     from jaeger_ai.core.runtime.modes import mode_info
     return mode_info()
 

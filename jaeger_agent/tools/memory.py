@@ -95,6 +95,11 @@ def search_memory(query: str, k: int = 5) -> dict[str, Any]:
     about yesterday?" or "what's that thing I mentioned about the
     printer?". Returns up to k past turns with cosine-similarity scores.
 
+    Results span EVERY past conversation. ``this_conversation`` is true
+    only for turns from the one you are in; anything else happened
+    elsewhere. For "what did I just say" in this conversation, read the
+    message thread instead of searching.
+
     Index is built lazily on first call from episodic.jsonl and cached
     on disk; subsequent calls reuse the cache until the log changes."""
     clean = (query or "").strip()
@@ -105,6 +110,12 @@ def search_memory(query: str, k: int = 5) -> dict[str, Any]:
     except AttributeError:
         # Older memory module without semantic search — graceful fall-through.
         return {"found": 0, "results": [], "error": "search_memory not available in this build"}
+    # Unlabelled hits let a model answer "what did I first ask you in this
+    # conversation?" with another session's turn (live WebUI, 2026-09-22).
+    from jaeger_agent.core.workspace import get_current_session
+    current = get_current_session()
+    for hit in hits:
+        hit["this_conversation"] = bool(current) and hit.get("session") == current
     return {"found": len(hits), "query": clean, "results": hits}
 
 
@@ -217,37 +228,6 @@ def _t_search_memory(query: str, k: int = 5) -> dict:
     return search_memory(query=query, k=k)
 
 
-@register_tool_from_function(name="session_search")
-def _t_session_search(query: str = "", session: str = "", limit: int = 10,
-                      since: str = "") -> dict:
-    """Search or list the agent's PAST CONVERSATIONS — its own session
-    history. Use for "what did we decide last week?", "which session was
-    the deploy one?", "show me my recent conversations", or to pick up a
-    thread from another session.
-
-    Differs from `search_memory`, which scores the CURRENT instance's
-    episodic log by meaning: this one is literal text matching ACROSS
-    sessions, and can list conversations rather than turns. Leave `query`
-    empty to browse recent turns; leave everything empty to list
-    conversations with their turn counts and time ranges.
-
-    `session` narrows to one conversation, `since` is an ISO date lower
-    bound ("2026-08-01"), `limit` caps results (max 100)."""
-    from jaeger_agent.memory import memory as mem
-
-    try:
-        if not (query or "").strip() and not session and not since:
-            sessions = mem.list_sessions(limit=limit)
-            return {"ok": True, "sessions": sessions, "count": len(sessions)}
-        hits = mem.search_sessions(
-            query=query, session_key=session or None,
-            limit=limit, since=since or None,
-        )
-        return {"ok": True, "turns": hits, "count": len(hits)}
-    except Exception as exc:  # noqa: BLE001 — a failed lookup is not a crash
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
 @register_tool_from_function(name="memory")
 def _t_memory(action: str, key: str = "", value: str = "",
               query: str = "", category: str = "", subject: str = "",
@@ -261,3 +241,6 @@ def _t_memory(action: str, key: str = "", value: str = "",
     ``describe_tool("memory")`` for the full when-to-call contract."""
     return memory(action=action, key=key, value=value, query=query,
                   category=category, subject=subject, tags=tags, note=note)
+
+# Specialist notes tool: registered with the memory tools it sits beside.
+from .agent_notes import agent_notes  # noqa: E402,F401

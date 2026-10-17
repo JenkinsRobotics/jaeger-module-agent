@@ -19,37 +19,42 @@ Upgrade to a per-turn handle if concurrent multi-session turns land.
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-_MAX_DETAIL = 200  # cap the input/output preview kept per step
-
-
-def _clip(s: Any, n: int = _MAX_DETAIL) -> str:
-    t = "" if s is None else str(s)
-    t = " ".join(t.split())  # collapse newlines / runs of whitespace
-    return t if len(t) <= n else t[: n - 1] + "…"
+def _safe_detail(value: Any) -> str:
+    """Record shape and correlation only; never persist prompt/tool content."""
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"chars={len(text)} sha256={digest}"
 
 
 # ── emit side: the live Tracer ──────────────────────────────────────
+
 class Tracer:
-    """Holds the current turn's id + clock; publishes TraceStep events."""
+    """Holds the current turn's id + clock; publishes TraceStep events (thread-safe, Hermes pattern)."""
 
     def __init__(self) -> None:
-        self._turn_id = 0
-        self._seq = 0
-        self._t0 = 0.0
-        self._session = ""
+        self._global_counter = 0
+        self._counter_lock = threading.Lock()
+        self._local = threading.local()
 
     def begin(self, session: str, user_text: str) -> int:
-        self._turn_id += 1
-        self._seq = 0
-        self._t0 = time.perf_counter()
-        self._session = session or ""
+        with self._counter_lock:
+            self._global_counter += 1
+            turn_id = self._global_counter
+        self._local.turn_id = turn_id
+        self._local.seq = 0
+        self._local.t0 = time.perf_counter()
+        self._local.session = session or ""
         self._emit("input", "", 0.0, 0.0, True, user_text)
-        return self._turn_id
+        return self._local.turn_id
 
     def step(self, kind: str, name: str = "", dur_s: float = 0.0,
              ok: bool = True, detail: Any = "") -> None:
@@ -60,19 +65,23 @@ class Tracer:
         self._emit("answer", "", self._offset(), float(total_s or 0.0), ok, answer)
 
     def _offset(self) -> float:
-        return max(0.0, time.perf_counter() - self._t0) if self._t0 else 0.0
+        t0 = getattr(self._local, "t0", 0.0)
+        return max(0.0, time.perf_counter() - t0) if t0 else 0.0
 
     def _emit(self, kind: str, name: str, t_offset_s: float,
               dur_s: float, ok: bool, detail: Any) -> None:
-        self._seq += 1
+        seq = getattr(self._local, "seq", 0) + 1
+        self._local.seq = seq
+        turn_id = getattr(self._local, "turn_id", self._global_counter)
+        session = getattr(self._local, "session", "")
         try:
             from jaeger_os.nodes import runtime
             from jaeger_os.transport import topics
             runtime.get_bus().publish(topics.TraceStep(
-                turn_id=self._turn_id, step_seq=self._seq, kind=kind,
+                turn_id=turn_id, step_seq=seq, kind=kind,
                 name=name or "", t_offset_s=round(t_offset_s, 4),
                 dur_s=round(dur_s, 4), ok=bool(ok),
-                detail=_clip(detail), session=self._session,
+                detail=_safe_detail(detail), session=session,
             ))
         except Exception:  # noqa: BLE001 — tracing never breaks a turn
             pass
@@ -96,7 +105,7 @@ def trace_end(answer: str, total_s: float, ok: bool = True) -> None:
 
 # ── record side: persist the bus stream to logs/trace.jsonl ──────────
 class TraceRecorder:
-    """Subscribes to ``SENSE_TRACE_STEP`` and appends each step to
+    """Subscribes to ``SYS_TRACE_STEP`` and appends each step to
     ``trace.jsonl``. Runs on the bus delivery thread — off the turn."""
 
     def __init__(self, path: Path) -> None:
@@ -113,14 +122,17 @@ class TraceRecorder:
             "t_offset_s": getattr(msg, "t_offset_s", 0.0),
             "dur_s": getattr(msg, "dur_s", 0.0),
             "ok": getattr(msg, "ok", True),
-            "detail": getattr(msg, "detail", ""),
-            "session": getattr(msg, "session", ""),
+            "detail": _safe_detail(getattr(msg, "detail", "")),
+            "session_hash": hashlib.sha256(
+                str(getattr(msg, "session", "")).encode()
+            ).hexdigest()[:16] if getattr(msg, "session", "") else "",
             "ts_ns": getattr(msg, "t_emit_ns", 0),
         }
         line = json.dumps(row, ensure_ascii=False, default=str)
         try:
             with self._lock, self.path.open("a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
+            os.chmod(self.path, 0o600)
         except Exception:  # noqa: BLE001
             pass
 
@@ -139,8 +151,11 @@ def start_trace_recorder(layout: Any) -> "TraceRecorder | None":
         try:
             from jaeger_os.nodes import runtime
             from jaeger_os.transport import topics
-            rec = TraceRecorder(layout.logs_dir / "trace.jsonl")
-            runtime.get_bus().subscribe(topics.SENSE_TRACE_STEP, rec.on_step)
+            logs = getattr(layout, "logs_dir", None)
+            if not isinstance(logs, (str, Path)):
+                return None  # a stand-in layout (tests, previews): nowhere real to write
+            rec = TraceRecorder(Path(logs) / "trace.jsonl")
+            runtime.get_bus().subscribe(topics.SYS_TRACE_STEP, rec.on_step)
             _recorder_started = True
             return rec
         except Exception:  # noqa: BLE001

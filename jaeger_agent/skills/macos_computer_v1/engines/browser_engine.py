@@ -8,7 +8,7 @@ reliable (DOM is stable, screen coordinates are not).
 
 Today this is a thin wrapper that delegates to the existing
 ``browser()`` tool implementation in
-:mod:`jaeger_os.agent.tools.browser`. The point is to let the
+:mod:`jaeger_agent.tools.browser`. The point is to let the
 planner CHOOSE the browser path semantically — "fill a form" or
 "click selector" routes here instead of the AX / vision tiers,
 regardless of whether the browser window has focus.
@@ -90,7 +90,8 @@ class BrowserEngine:
             "click_selector": "click", "browser_click": "click",
             "fill": "type", "browser_type": "type",
             "extract_text": "snapshot", "browser_read": "snapshot",
-            "screenshot_page": "snapshot", "browser_snapshot": "snapshot",
+            "screenshot_page": "screenshot", "browser_snapshot": "snapshot",
+            "screenshot": "screenshot", "browser_screenshot": "screenshot",
         }
         verb = verb_map.get(kind, kind)
         try:
@@ -101,6 +102,7 @@ class BrowserEngine:
                 text=str(args.get("text", "") or args.get("value", "")),
                 direction=str(args.get("direction", "down")),
                 key=str(args.get("key", "Enter")),
+                path=str(args.get("path", "") or ""),
             )
         except Exception as exc:  # noqa: BLE001
             return EngineResult(

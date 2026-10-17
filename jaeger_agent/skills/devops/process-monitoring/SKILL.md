@@ -1,15 +1,32 @@
 ---
 name: process-monitoring
-description: "Check what's running, what's using resources, or whether a process/service is alive — 'what's eating my memory', 'is X running', 'check CPU usage', 'why is my fan spinning', 'is the server still up'. Load this for any 'what's my machine doing' question before reaching for raw terminal commands."
-version: 1.0.0
-platforms: [macos, linux]
-requires_tools: [terminal]
-requires_toolsets: [code]
+description: Check what's running, what's using resources, or whether a process/service
+  is alive — 'what's eating my memory', 'is X running', 'check CPU usage', 'why is
+  my fan spinning', 'is the server still up'. Load this for any 'what's my machine
+  doing' question before reaching for raw terminal commands.
 metadata:
   jros:
-    tags: [process, monitoring, cpu, memory, ps, top, lsof, launchctl]
+    tags:
+    - process
+    - monitoring
+    - cpu
+    - memory
+    - ps
+    - top
+    - lsof
+    - launchctl
     category: devops
-    related_skills: [log-calculations]
+    related_skills:
+    - log-calculations
+    - jaeger-webui
+    version: 1.1.0
+    platforms:
+    - macos
+    - linux
+    requires-tools:
+    - terminal
+    requires-toolsets:
+    - code
 ---
 
 # PROCESS MONITORING — READ-ONLY RECIPES
@@ -96,4 +113,6 @@ terminal(command="vm_stat")                              macOS memory pressure d
 
 The user has the specific numbers/process names that answer their
 question, sourced from an actual command run this turn — and any
-suggested fix was proposed, not silently executed.
+suggested fix was proposed, not silently executed. A LISTEN/HTTP 200
+is process-up, not product-up. For the Jaeger chat UI (frozen page,
+wrong version, hard refresh/reset, chat 500) load `jaeger-webui`.

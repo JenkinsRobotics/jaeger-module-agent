@@ -42,14 +42,15 @@ import contextlib
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Iterator
+from collections.abc import Callable, Iterator
+from typing import Any
 
 
 # Bumped on schema changes. Migration writers in
 # ``core/memory/migrations/`` apply each step from the on-disk version
 # up to ``SCHEMA_VERSION``; the store refuses to open a DB written by
 # a newer SCHEMA_VERSION than the current code knows about.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
 
 _DB_FILENAME = "state.db"
 
@@ -98,6 +99,8 @@ def bind(layout: Any) -> None:
     _state["connections"] = [conn]
     _state["vec_loaded"] = _try_load_vec(conn)
     _ensure_schema(conn)
+    from jaeger_agent.memory.sqlite_search import ensure_fts5_schema
+    ensure_fts5_schema(conn)
 
 
 def close() -> None:
@@ -140,6 +143,7 @@ def _open(path: Path, *, set_journal_mode: bool = True) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+
     return conn
 
 
@@ -320,6 +324,152 @@ _SCHEMA_STATEMENTS: tuple[str, ...] = (
     )""",
     "CREATE INDEX IF NOT EXISTS idx_audit_event ON audit_log (event, ts)",
     "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts)",
+
+    # commitments — durable SI intentions (goals/runs) that survive restart.
+    """CREATE TABLE IF NOT EXISTS commitments (
+        id            TEXT PRIMARY KEY,
+        title         TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        kind          TEXT NOT NULL DEFAULT 'goal',
+        payload_json  TEXT NOT NULL DEFAULT '{}',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        parent_id     TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_commitments_state ON commitments (state, updated_at)",
+
+    # runs — one attempt at a commitment. Owns the pid claim and the
+    # wake key; see jaeger_agent/cognition/runs.py for the state machine.
+    """CREATE TABLE IF NOT EXISTS runs (
+        id            TEXT PRIMARY KEY,
+        commitment_id TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        attempt       INTEGER NOT NULL DEFAULT 1,
+        owner_pid     INTEGER,
+        heartbeat_at  TEXT,
+        wake_key      TEXT,
+        provider      TEXT,
+        reason        TEXT,
+        payload_json  TEXT NOT NULL DEFAULT '{}',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+        ,parent_run_id TEXT
+        ,root_run_id   TEXT
+        ,relation      TEXT NOT NULL DEFAULT 'root'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_runs_state ON runs (state, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_commitment ON runs (commitment_id, attempt)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_wake ON runs (wake_key) WHERE wake_key IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_runs_root ON runs (root_run_id, created_at)",
+
+    # checkpoints — append-only resumption cursors, one row per save.
+    # PK (run_id, seq) makes a duplicate sequence number a constraint
+    # error rather than a silently lost checkpoint.
+    """CREATE TABLE IF NOT EXISTS checkpoints (
+        run_id      TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        cursor_json TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (run_id, seq)
+    )""",
+
+    # effects — at-most-once ledger for authoritative side effects.
+    # The PK on key is the claim: a second claim of a live key is a
+    # constraint error, which is how duplicate sends are prevented
+    # even when two processes race.
+    """CREATE TABLE IF NOT EXISTS effects (
+        key          TEXT PRIMARY KEY,
+        action       TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        result_json  TEXT,
+        run_id       TEXT,
+        claimed_at   TEXT NOT NULL,
+        completed_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_effects_status ON effects (status, claimed_at)",
+
+    # ── Cognitive architecture (v5) ──────────────────────────────────
+    # claims — propositions with explicit epistemic provenance
+    """CREATE TABLE IF NOT EXISTS claims (
+        id            TEXT PRIMARY KEY,
+        subject       TEXT NOT NULL,
+        predicate     TEXT NOT NULL,
+        value         TEXT NOT NULL,
+        provenance    TEXT NOT NULL,
+        source_id     TEXT NOT NULL DEFAULT 'user',
+        confidence    REAL NOT NULL DEFAULT 1.0,
+        status        TEXT NOT NULL DEFAULT 'valid',
+        valid_from    TEXT,
+        valid_until   TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_claims_subject_pred ON claims (subject, predicate, status)",
+    "CREATE INDEX IF NOT EXISTS idx_claims_provenance ON claims (provenance)",
+    "CREATE INDEX IF NOT EXISTS idx_claims_created ON claims (created_at)",
+
+    # beliefs before evidence so the belief_id FK has a table to name
+    """CREATE TABLE IF NOT EXISTS beliefs (
+        id                TEXT PRIMARY KEY,
+        subject           TEXT NOT NULL,
+        predicate         TEXT NOT NULL,
+        value             TEXT NOT NULL,
+        confidence        REAL NOT NULL DEFAULT 1.0,
+        status            TEXT NOT NULL DEFAULT 'active',
+        valid_from        TEXT,
+        valid_until       TEXT,
+        superseded_by     TEXT,
+        evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at        TEXT NOT NULL,
+        updated_at        TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_beliefs_subject_pred ON beliefs (subject, predicate, status)",
+    "CREATE INDEX IF NOT EXISTS idx_beliefs_status ON beliefs (status, updated_at)",
+
+    # evidence — links tying claims/beliefs to turns, tool executions, or documents
+    """CREATE TABLE IF NOT EXISTS evidence (
+        id           TEXT PRIMARY KEY,
+        claim_id     TEXT REFERENCES claims(id) ON DELETE CASCADE,
+        belief_id    TEXT REFERENCES beliefs(id) ON DELETE CASCADE,
+        event_id     TEXT,
+        source_type  TEXT NOT NULL DEFAULT 'turn',
+        snippet      TEXT NOT NULL DEFAULT '',
+        uri          TEXT,
+        created_at   TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_claim ON evidence (claim_id)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_belief ON evidence (belief_id)",
+
+    # entities — structured world model actors, tools, workspaces
+    """CREATE TABLE IF NOT EXISTS entities (
+        id              TEXT PRIMARY KEY,
+        name            TEXT NOT NULL,
+        kind            TEXT NOT NULL DEFAULT 'concept',
+        aliases_json    TEXT NOT NULL DEFAULT '[]',
+        attributes_json TEXT NOT NULL DEFAULT '{}',
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities (name)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities (kind)",
+
+    # relationships — typed directed connections between entities
+    """CREATE TABLE IF NOT EXISTS relationships (
+        id             TEXT PRIMARY KEY,
+        source_entity  TEXT NOT NULL,
+        target_entity  TEXT NOT NULL,
+        relation_type  TEXT NOT NULL,
+        confidence     REAL NOT NULL DEFAULT 1.0,
+        valid_from     TEXT,
+        valid_until    TEXT,
+        metadata_json  TEXT NOT NULL DEFAULT '{}',
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_relationships_st ON relationships (source_entity, target_entity)",
+    "CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships (relation_type)",
 )
 
 
@@ -328,7 +478,15 @@ def _migrate_facts_table(conn: sqlite3.Connection) -> None:
     tags / note + composite PK ``(subject, key, source)``). Idempotent: a
     no-op on a fresh DB (no table yet) or one already at v2. Existing rows
     become subject='user', source='user'. Runs before the schema CREATE
-    INDEXes that reference the new columns."""
+    INDEXes that reference the new columns.
+
+    Does not begin or commit a transaction — the caller
+    (``_ensure_schema``) wraps apply + version stamp in one
+    ``BEGIN IMMEDIATE`` so a failure cannot leave v2 tables wearing a
+    v1 label, or the reverse. ``executescript`` is deliberately not used:
+    the stdlib issues a COMMIT before running the script, which would
+    split the stamp from the change.
+    """
     exists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts'"
     ).fetchone()
@@ -344,115 +502,423 @@ def _migrate_facts_table(conn: sqlite3.Connection) -> None:
     src = "source" if "source" in cols else "'user'"
     tg = "tags" if "tags" in cols else "''"
     nt = "note" if "note" in cols else "''"
-    try:
-        conn.executescript(
-            f"""
-            BEGIN;
-            DROP TABLE IF EXISTS _facts_v2;
-            CREATE TABLE _facts_v2 (
-                subject    TEXT NOT NULL DEFAULT 'user',
-                key        TEXT NOT NULL,
-                value      TEXT NOT NULL,
-                category   TEXT NOT NULL DEFAULT 'general',
-                source     TEXT NOT NULL DEFAULT 'user',
-                tags       TEXT NOT NULL DEFAULT '',
-                note       TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (subject, key, source)
-            );
-            INSERT OR IGNORE INTO _facts_v2
-                (subject, key, value, category, source, tags, note, created_at, updated_at)
-                SELECT {subj}, key, value, category, {src}, {tg}, {nt},
-                       created_at, updated_at
-                FROM facts;
-            -- Seed the history log so migrated facts are traceable from day
-            -- one (recall_history must not return empty for a fact that
-            -- demonstrably existed). fact_log may not exist yet — this
-            -- migration runs BEFORE the schema statements.
-            CREATE TABLE IF NOT EXISTS fact_log (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject    TEXT NOT NULL DEFAULT 'user',
-                key        TEXT NOT NULL,
-                value      TEXT NOT NULL,
-                category   TEXT NOT NULL DEFAULT 'general',
-                source     TEXT NOT NULL DEFAULT 'user',
-                tags       TEXT NOT NULL DEFAULT '',
-                note       TEXT NOT NULL DEFAULT '',
-                ts         TEXT NOT NULL
-            );
-            INSERT INTO fact_log
-                (subject, key, value, category, source, tags, note, ts)
-                SELECT subject, key, value, category, source, tags,
-                       'migrated from schema v1', updated_at
-                FROM _facts_v2;
-            DROP TABLE facts;
-            ALTER TABLE _facts_v2 RENAME TO facts;
-            COMMIT;
-            """
+    conn.execute("DROP TABLE IF EXISTS _facts_v2")
+    conn.execute(
+        """
+        CREATE TABLE _facts_v2 (
+            subject    TEXT NOT NULL DEFAULT 'user',
+            key        TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            category   TEXT NOT NULL DEFAULT 'general',
+            source     TEXT NOT NULL DEFAULT 'user',
+            tags       TEXT NOT NULL DEFAULT '',
+            note       TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (subject, key, source)
         )
-    except sqlite3.Error:
-        # A mid-script failure leaves the transaction open on this
-        # autocommit connection — roll it back explicitly so the old
-        # table survives intact, then re-raise (refusing to run on a
-        # half-migrated DB beats limping on one).
-        with contextlib.suppress(sqlite3.Error):
-            conn.execute("ROLLBACK")
-        raise
+        """
+    )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO _facts_v2
+            (subject, key, value, category, source, tags, note, created_at, updated_at)
+            SELECT {subj}, key, value, category, {src}, {tg}, {nt},
+                   created_at, updated_at
+            FROM facts
+        """
+    )
+    # Seed the history log so migrated facts are traceable from day
+    # one (recall_history must not return empty for a fact that
+    # demonstrably existed). fact_log may not exist yet — this
+    # migration runs BEFORE the schema statements.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fact_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject    TEXT NOT NULL DEFAULT 'user',
+            key        TEXT NOT NULL,
+            value      TEXT NOT NULL,
+            category   TEXT NOT NULL DEFAULT 'general',
+            source     TEXT NOT NULL DEFAULT 'user',
+            tags       TEXT NOT NULL DEFAULT '',
+            note       TEXT NOT NULL DEFAULT '',
+            ts         TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO fact_log
+            (subject, key, value, category, source, tags, note, ts)
+            SELECT subject, key, value, category, source, tags,
+                   'migrated from schema v1', updated_at
+            FROM _facts_v2
+        """
+    )
+    conn.execute("DROP TABLE facts")
+    conn.execute("ALTER TABLE _facts_v2 RENAME TO facts")
+
+
+# Ordered migrations, keyed by the version they PRODUCE. A database at
+# version N-1 reaches N by running MIGRATIONS[N] and only then recording N.
+#
+# This replaces a branch that did the opposite: an older database had its
+# version row UPDATEd straight to SCHEMA_VERSION with no transformation run,
+# so a v1 store came out labelled v2 while still holding v1 tables. Every
+# later reader then trusted a version number that described a shape the
+# database did not have — the failure mode a version stamp exists to prevent.
+#
+# The invariant, stated so it survives the next edit: THE RECORDED VERSION
+# MUST NAME THE SCHEMA THAT ACTUALLY RAN. A step with no migration is a hard
+# error, not something to paper over by advancing the number.
+def _migrate_commitments(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS commitments (
+            id            TEXT PRIMARY KEY,
+            title         TEXT NOT NULL,
+            state         TEXT NOT NULL,
+            kind          TEXT NOT NULL DEFAULT 'goal',
+            payload_json  TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_commitments_state "
+        "ON commitments (state, updated_at)"
+    )
+
+
+def _migrate_runtime(conn: sqlite3.Connection) -> None:
+    """v4 — the durable execution layer: runs, checkpoints, effects.
+
+    A v3 database has commitments (what the SI intends) but no record of
+    the attempts to discharge them, so a crash lost the attempt entirely.
+    This step adds the three tables that survive it, plus ``parent_id``
+    on commitments for goal nesting.
+
+    Additive only: no existing row is read, rewritten or dropped, so the
+    downgrade path is "ignore these tables" rather than a restore.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            id            TEXT PRIMARY KEY,
+            commitment_id TEXT NOT NULL,
+            state         TEXT NOT NULL,
+            attempt       INTEGER NOT NULL DEFAULT 1,
+            owner_pid     INTEGER,
+            heartbeat_at  TEXT,
+            wake_key      TEXT,
+            provider      TEXT,
+            reason        TEXT,
+            payload_json  TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            run_id      TEXT NOT NULL,
+            seq         INTEGER NOT NULL,
+            cursor_json TEXT NOT NULL,
+            created_at  TEXT NOT NULL,
+            PRIMARY KEY (run_id, seq)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS effects (
+            key          TEXT PRIMARY KEY,
+            action       TEXT NOT NULL,
+            status       TEXT NOT NULL,
+            result_json  TEXT,
+            run_id       TEXT,
+            claimed_at   TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
+    # ALTER TABLE ADD COLUMN has no IF NOT EXISTS before SQLite 3.35 and
+    # errors on a re-run either way, so the column is probed first. The
+    # commitments table may not exist yet on a database that reached here
+    # without ever opening v3 statements; CREATE ... IF NOT EXISTS above
+    # does not cover it, so guard on presence rather than assuming.
+    has_commitments = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='commitments'"
+    ).fetchone()
+    if has_commitments:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(commitments)").fetchall()
+        }
+        if "parent_id" not in columns:
+            conn.execute("ALTER TABLE commitments ADD COLUMN parent_id TEXT")
+
+
+def _migrate_knowledge(conn: sqlite3.Connection) -> None:
+    """v5 — epistemic knowledge: claims, beliefs, evidence, entities, relationships.
+
+    v4 recorded what the SI did. v5 records what it knows, and *how* it
+    knows it. Additive only: no existing row is read, rewritten or dropped.
+    Beliefs are created before evidence so the belief_id FK names a table
+    that already exists.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claims (
+            id            TEXT PRIMARY KEY,
+            subject       TEXT NOT NULL,
+            predicate     TEXT NOT NULL,
+            value         TEXT NOT NULL,
+            provenance    TEXT NOT NULL,
+            source_id     TEXT NOT NULL DEFAULT 'user',
+            confidence    REAL NOT NULL DEFAULT 1.0,
+            status        TEXT NOT NULL DEFAULT 'valid',
+            valid_from    TEXT,
+            valid_until   TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_claims_subject_pred "
+        "ON claims (subject, predicate, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_claims_provenance ON claims (provenance)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_claims_created ON claims (created_at)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS beliefs (
+            id                TEXT PRIMARY KEY,
+            subject           TEXT NOT NULL,
+            predicate         TEXT NOT NULL,
+            value             TEXT NOT NULL,
+            confidence        REAL NOT NULL DEFAULT 1.0,
+            status            TEXT NOT NULL DEFAULT 'active',
+            valid_from        TEXT,
+            valid_until       TEXT,
+            superseded_by     TEXT,
+            evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_beliefs_subject_pred "
+        "ON beliefs (subject, predicate, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_beliefs_status "
+        "ON beliefs (status, updated_at)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence (
+            id           TEXT PRIMARY KEY,
+            claim_id     TEXT REFERENCES claims(id) ON DELETE CASCADE,
+            belief_id    TEXT REFERENCES beliefs(id) ON DELETE CASCADE,
+            event_id     TEXT,
+            source_type  TEXT NOT NULL DEFAULT 'turn',
+            snippet      TEXT NOT NULL DEFAULT '',
+            uri          TEXT,
+            created_at   TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_claim ON evidence (claim_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_belief ON evidence (belief_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entities (
+            id              TEXT PRIMARY KEY,
+            name            TEXT NOT NULL,
+            kind            TEXT NOT NULL DEFAULT 'concept',
+            aliases_json    TEXT NOT NULL DEFAULT '[]',
+            attributes_json TEXT NOT NULL DEFAULT '{}',
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entities_name ON entities (name)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entities_kind ON entities (kind)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS relationships (
+            id             TEXT PRIMARY KEY,
+            source_entity  TEXT NOT NULL,
+            target_entity  TEXT NOT NULL,
+            relation_type  TEXT NOT NULL,
+            confidence     REAL NOT NULL DEFAULT 1.0,
+            valid_from     TEXT,
+            valid_until    TEXT,
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_relationships_st "
+        "ON relationships (source_entity, target_entity)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_relationships_type "
+        "ON relationships (relation_type)"
+    )
+
+
+def _migrate_run_lineage(conn: sqlite3.Connection) -> None:
+    """v6 — durable parent/root ancestry for delegated/background runs."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "parent_run_id" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
+    if "root_run_id" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN root_run_id TEXT")
+    if "relation" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN relation TEXT NOT NULL DEFAULT 'root'")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs (parent_run_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_root ON runs (root_run_id, created_at)")
+
+
+_MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
+    2: ("facts-subject-source-tags-note", lambda conn: _migrate_facts_table(conn)),
+    3: ("commitments", _migrate_commitments),
+    4: ("runtime-runs-checkpoints-effects", _migrate_runtime),
+    5: ("cognitive-knowledge-foundation", _migrate_knowledge),
+    6: ("durable-run-lineage", _migrate_run_lineage),
+}
+
+
+def _record_schema_version(conn: sqlite3.Connection, version: int, now: str) -> None:
+    """Write the version row, inserting it if this database predates it."""
+    updated = conn.execute(
+        "UPDATE schema_version SET version = ?, updated_at = ? WHERE id = 1",
+        (version, now),
+    ).rowcount
+    if not updated:
+        conn.execute(
+            "INSERT INTO schema_version (id, version, created_at, updated_at) "
+            "VALUES (1, ?, ?, ?)",
+            (version, now, now),
+        )
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Create / migrate the schema to ``SCHEMA_VERSION``.
 
-    First-open: every CREATE TABLE runs cleanly (IF NOT EXISTS), the
-    schema_version row is INSERTed at the target version (v2).
+    First open: every CREATE TABLE runs cleanly (IF NOT EXISTS) and the
+    version row is written at the target — a database built from the current
+    statements IS the current schema, so there is nothing to migrate.
 
-    Same-version reopen: every CREATE TABLE no-ops; the
-    schema_version row matches and we just return.
+    Same-version reopen: the CREATE statements no-op and the version matches,
+    so this returns without touching anything. That idempotence is what makes
+    it safe on every open.
 
-    Older DB (v1 facts shape): ``_migrate_facts_table`` detects the old
-    SHAPE (columns + PK, not the version number — robust to partially
-    migrated intermediates) and rebuilds ``facts`` into the v2
-    subject/source/tags/note form BEFORE the schema statements run,
-    because the v2 indexes reference columns a v1 table lacks. The
-    version row is then bumped to v2 below.
+    Older database: each pending migration runs IN ITS OWN TRANSACTION, and
+    the new version is recorded inside that same transaction. A failure rolls
+    back the step and the stamp together, leaving the database coherent at the
+    last version that genuinely completed — so a retry resumes there instead
+    of skipping the step that failed.
+
+    Newer database: refused. Writing an old shape over a newer one is not
+    recoverable; stopping is.
     """
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    cur = conn.cursor()
-    # v1 → v2: rebuild an older `facts` table into the subject/source/tags/note
-    # shape BEFORE the schema statements — the new indexes reference columns an
-    # old table lacks. No-op on a fresh DB or one already at v2.
-    _migrate_facts_table(conn)
-    cur.executescript("BEGIN; " + "; ".join(_SCHEMA_STATEMENTS) + "; COMMIT;")
+    # The version row lives in a table the schema statements create, so on a
+    # database that predates it we have to make the table before we can ask.
+    # CREATE TABLE IF NOT EXISTS is safe on every path.
+    conn.execute(_SCHEMA_STATEMENTS[0])
+    row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    current = int(row["version"]) if row is not None else None
 
-    row = conn.execute(
-        "SELECT version FROM schema_version WHERE id = 1"
-    ).fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO schema_version (id, version, created_at, updated_at) "
-            "VALUES (1, ?, ?, ?)",
-            (SCHEMA_VERSION, now, now),
-        )
-        return
-
-    current = int(row["version"])
-    if current == SCHEMA_VERSION:
-        return
-    if current > SCHEMA_VERSION:
+    if current is not None and current > SCHEMA_VERSION:
         raise RuntimeError(
             f"state.db schema is v{current} but installed core knows "
             f"only v{SCHEMA_VERSION} — upgrade the framework."
         )
-    # Older version → future migration runner. Today there's only v1
-    # so this branch only fires on an explicit downgrade-of-downgrade
-    # test scenario.
-    conn.execute(
-        "UPDATE schema_version SET version = ?, updated_at = ? WHERE id = 1",
-        (SCHEMA_VERSION, now),
-    )
+
+    if current is None:
+        # No version row. Either a brand-new database, or one written before
+        # versioning existed. They are distinguishable: a pre-versioning store
+        # already has a `facts` table, a new one does not.
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='facts'"
+        ).fetchone()
+        current = 1 if legacy else SCHEMA_VERSION
+        if not legacy:
+            # Fresh: build the current shape and record it as such.
+            conn.executescript("BEGIN; " + "; ".join(_SCHEMA_STATEMENTS) + "; COMMIT;")
+            _record_schema_version(conn, SCHEMA_VERSION, now)
+            conn.commit()
+            return
+        _record_schema_version(conn, current, now)
+        conn.commit()
+
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        step = _MIGRATIONS.get(version)
+        if step is None:
+            raise RuntimeError(
+                f"state.db is at v{current} and this build targets "
+                f"v{SCHEMA_VERSION}, but no migration is registered for v{version}. "
+                "Refusing to advance the recorded version without running one."
+            )
+        name, apply = step
+        try:
+            # Close an implicit transaction so BEGIN IMMEDIATE is legal on
+            # both production (isolation_level=None) and default-isolation
+            # connections. executescript is not used here: it COMMITs first.
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("COMMIT")
+            conn.execute("BEGIN IMMEDIATE")
+            apply(conn)
+            # The version is recorded in the SAME transaction as the change
+            # it describes, so the two can never disagree.
+            _record_schema_version(conn, version, now)
+            conn.execute("COMMIT")
+        except Exception as exc:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            raise RuntimeError(
+                f"state.db migration to v{version} ({name}) failed: {exc}. "
+                f"The database is unchanged at v{current}."
+            ) from exc
+        current = version
+
+    # Bring indexes and any newly added tables into being once the shape is
+    # right — v2 indexes reference columns a v1 table lacked, which is why
+    # this runs after the migrations rather than before them.
+    conn.executescript("BEGIN; " + "; ".join(_SCHEMA_STATEMENTS) + "; COMMIT;")
+    _record_schema_version(conn, SCHEMA_VERSION, now)
+    conn.commit()
 
 
 # ── connection access ─────────────────────────────────────────────
@@ -538,3 +1004,39 @@ __all__ = [
     "is_bound",
     "db_path",
 ]
+
+
+def seed_facts(layout: Any, facts: dict[str, str]) -> None:
+    """Persist operator-supplied setup facts without rebinding the active agent.
+
+    Existing facts win on repeated setup. Each newly inserted assertion gets
+    an audit-history row in the same transaction.
+    """
+    from datetime import datetime, timezone
+
+    path = layout.memory_dir / _DB_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _open(path)
+    try:
+        _ensure_schema(conn)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        conn.execute("BEGIN IMMEDIATE")
+        for key, value in facts.items():
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO facts "
+                "(subject, key, value, category, source, note, created_at, updated_at) "
+                "VALUES ('user', ?, ?, 'personal', 'user', 'Instance setup', ?, ?)",
+                (key, value, now, now),
+            ).rowcount
+            if inserted:
+                conn.execute(
+                    "INSERT INTO fact_log (subject, key, value, category, source, note, ts) "
+                    "VALUES ('user', ?, ?, 'personal', 'user', 'Instance setup', ?)",
+                    (key, value, now),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

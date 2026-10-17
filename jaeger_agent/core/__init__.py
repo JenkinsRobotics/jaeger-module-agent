@@ -5,3 +5,4 @@ The package's extension surfaces remain visible as top-level siblings:
 agent/runtime and multimodal orchestration that connects those capabilities,
 matching the anatomy used by :mod:`jaeger_agent_omni.core`.
 """
+

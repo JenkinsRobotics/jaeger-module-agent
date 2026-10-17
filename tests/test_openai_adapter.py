@@ -100,8 +100,11 @@ def _mk_tool() -> ToolDef:
 # ── construction + provider variants ───────────────────────────────
 
 
-def test_known_providers_includes_the_five_supported_backends():
-    assert {"openai", "lmstudio", "ollama", "ollama-cloud", "gemini"} == KNOWN_PROVIDERS
+def test_known_providers_includes_supported_backends():
+    assert {
+        "openai", "lmstudio", "ollama", "ollama-cloud", "gemini",
+        "openrouter", "groq", "deepseek", "vllm", "together",
+    } == KNOWN_PROVIDERS
 
 
 def test_local_servers_get_placeholder_key_when_none_supplied():
@@ -316,6 +319,7 @@ def test_call_dispatches_to_chat_completions_with_merged_kwargs():
 
 def _mk_chunk(
     content: str | None = None,
+    reasoning: str | None = None,
     tool_call: dict[str, Any] | None = None,
     finish_reason: str | None = None,
     usage: dict[str, int] | None = None,
@@ -331,7 +335,7 @@ def _mk_chunk(
                 arguments=tool_call.get("arguments"),
             ),
         )]
-    delta = SimpleNamespace(content=content, tool_calls=tcs)
+    delta = SimpleNamespace(content=content, reasoning=reasoning, tool_calls=tcs)
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(
         choices=[choice],
@@ -395,6 +399,27 @@ def test_call_streams_transport_by_default_and_aggregates():
     assert raw["usage"]["total_tokens"] == 10
 
 
+def test_call_preserves_streamed_reasoning_separately_from_answer():
+    stream = _FakeStream([
+        _mk_chunk(reasoning="check evidence "),
+        _mk_chunk(reasoning="then act"),
+        _mk_chunk(content="done", finish_reason="stop"),
+    ])
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: stream),
+        ),
+    )
+    a = OpenAIAdapter(provider="ollama-cloud", model="qwen", client=client)
+
+    parsed = a.parse_response(
+        a.call({"model": "qwen", "messages": []}, threading.Event()),
+    )
+
+    assert parsed["content"] == "done"
+    assert parsed["reasoning"] == "check evidence then act"
+
+
 def test_call_compat_providers_do_not_send_stream_options():
     """LM Studio / Ollama / Gemini-compat servers may reject the
     OpenAI-only ``stream_options`` field — it must stay off the wire
@@ -415,6 +440,33 @@ def test_call_compat_providers_do_not_send_stream_options():
     a.call({"model": "x", "messages": []}, threading.Event())
     assert client.last_kwargs["stream"] is True
     assert "stream_options" not in client.last_kwargs
+
+
+@pytest.mark.parametrize("provider", ["ollama", "ollama-cloud"])
+def test_current_ollama_requests_streamed_usage(provider):
+    stream = _FakeStream([_mk_chunk(content="ok", finish_reason="stop")])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions(stream)))
+    adapter = OpenAIAdapter(provider=provider, model="x", client=client)
+
+    adapter.call({"model": "x", "messages": []}, threading.Event())
+
+    assert client.chat.completions.last_kwargs["stream_options"] == {"include_usage": True}
+
+
+def test_parse_response_preserves_cached_prompt_tokens():
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=20,
+        total_tokens=120,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=75),
+    )
+    raw = _mk_response("ok")
+    raw.usage = usage
+    adapter = OpenAIAdapter(provider="ollama", model="x", client=_FakeClient(raw))
+
+    adapter.parse_response(raw)
+
+    assert adapter.last_usage["cached_prompt_tokens"] == 75
 
 
 def test_call_interrupt_mid_stream_closes_and_raises():
@@ -471,6 +523,20 @@ def test_parse_response_returns_assistant_text_only():
     assert "tool_calls" not in parsed
 
 
+def test_parse_response_preserves_reasoning_content_alias():
+    a = OpenAIAdapter(provider="ollama-cloud", model="qwen")
+    message = SimpleNamespace(
+        content="answer", tool_calls=None, reasoning_content="private trace",
+    )
+    raw = SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason="stop")], usage=None,
+    )
+
+    parsed = a.parse_response(raw)
+
+    assert parsed["reasoning"] == "private trace"
+
+
 def test_parse_response_lifts_tool_calls_with_json_decoded_arguments():
     a = OpenAIAdapter(provider="openai", model="x", client=_FakeClient(_mk_response("ok")))
     raw = _mk_response(
@@ -503,6 +569,30 @@ def test_parse_response_decodes_malformed_json_to_raw_arguments_field():
     a = OpenAIAdapter(provider="openai", model="x", client=_FakeClient(_mk_response("ok")))
     parsed = a.parse_response(raw)
     assert parsed["tool_calls"][0]["arguments"] == {"_raw_arguments": '{"x": broken'}
+
+
+def test_parse_response_truncated_json_does_not_dispatch_as_recovered():
+    """F1 live failure: a length-cut ``write_file`` payload closed its
+    own string and brace, ``recovered=True``, and the truncated
+    content was written as if complete. The structured path must
+    stash ``_raw_arguments`` so the tool is not called."""
+    cut = '{"path": "item_00.txt", "content": "hello'
+    raw = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id="c1",
+                type="function",
+                function=SimpleNamespace(name="write_file", arguments=cut),
+            )],
+        ))],
+        usage=None,
+    )
+    a = OpenAIAdapter(provider="openai", model="x", client=_FakeClient(_mk_response("ok")))
+    parsed = a.parse_response(raw)
+    args = parsed["tool_calls"][0]["arguments"]
+    assert args == {"_raw_arguments": cut}
+    assert "content" not in args
 
 
 def test_parse_response_handles_empty_choices():
@@ -640,3 +730,10 @@ def test_openai_adapter_drives_jaeger_agent_loop_to_completion():
         ]
     finally:
         clear_registry()
+
+
+def test_reasoning_only_length_stop_is_not_an_empty_retry():
+    adapter = OpenAIAdapter(provider='ollama-cloud', model='test')
+    parsed = adapter.parse_response({'choices': [{'message': {
+        'content': '', 'reasoning_content': 'reasoning without final answer'}, 'finish_reason': 'length'}]})
+    assert parsed['finish_reason'] == 'thinking_exhausted'

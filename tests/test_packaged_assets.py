@@ -17,8 +17,8 @@ in a routing score nobody reads until Friday.
 from __future__ import annotations
 
 import pathlib
-import pytest
 import jaeger_agent
+import pytest
 
 PACKAGE = pathlib.Path(jaeger_agent.__file__).resolve().parent
 NODES = (
@@ -68,6 +68,10 @@ def test_package_root_contains_only_public_entry_surfaces() -> None:
         "__init__.py",
         "__main__.py",
         "module.yaml",
+        # Incoming runtime services remain public module entry points.
+        "tool_executor.py", "subagent_worktree.py", "tirith.py",
+        "checkpoints.py", "delegation_context.py", "instance_config.py",
+        "shell_hooks.py", "task_port.py",
     }
 
 

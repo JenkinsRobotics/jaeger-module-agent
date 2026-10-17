@@ -1,19 +1,35 @@
 """``OpenAIAdapter`` — every OpenAI-compatible backend in one class.
 
-One adapter, five backends. The chat-completions wire format is
-identical across:
+Named for the **wire protocol, not the vendor.** "OpenAI-compatible" is the
+industry term for the ``POST /v1/chat/completions`` shape, and nine of the ten
+backends below are not OpenAI. Ollama, vLLM, LM Studio, Groq, DeepSeek,
+Together and OpenRouter each document their own API as OpenAI-compatible, so
+this is the name a reader coming from any of their docs will look for. If you
+are running a local model, you are running it through this file.
 
-  • OpenAI itself (api.openai.com)
-  • Google Gemini's OpenAI-compatible endpoint
-    (generativelanguage.googleapis.com/v1beta/openai/)
-  • Ollama Cloud (ollama.com/v1) — hosted, API-key required
-  • Local Ollama (localhost:11434/v1) — placeholder key accepted
-  • LM Studio (localhost:1234/v1) — placeholder key accepted
+The ten providers in ``KNOWN_PROVIDERS``:
 
-The differences are at construction time (base URL + how the API key
-is sourced), not in the request shape. So one adapter handles all
-five — the ``provider`` slug is recorded for diagnostics and to pick
-the right placeholder key when a real one isn't required.
+  • ``openai``        OpenAI itself (api.openai.com)
+  • ``gemini``        Google's compat endpoint
+                      (generativelanguage.googleapis.com/v1beta/openai/)
+  • ``openrouter``    multi-model broker
+  • ``groq``          hosted inference
+  • ``deepseek``      hosted; streams reasoning as ``reasoning_content``
+  • ``together``      hosted inference
+  • ``ollama-cloud``  ollama.com/v1 — hosted, real API key required
+  • ``ollama``        localhost:11434/v1 — placeholder key accepted
+  • ``lmstudio``      localhost:1234/v1 — placeholder key accepted
+  • ``vllm``          self-hosted server — placeholder key accepted
+
+The differences are at construction time (base URL + how the API key is
+sourced), not in the request shape. So one adapter handles all ten — the
+``provider`` slug is recorded for diagnostics and to pick the right
+placeholder key when a real one isn't required. Adding an eleventh
+OpenAI-compatible host means adding a slug, not a file.
+
+``local_llama.py`` subclasses this adapter rather than reimplementing the
+protocol: llama.cpp also speaks chat-completions, and only its model-loading
+and ``<think>``-block handling differ.
 
 Wire-format quirks vs Anthropic, all handled below:
 
@@ -24,6 +40,9 @@ Wire-format quirks vs Anthropic, all handled below:
     not embedded in a user turn (Anthropic's pattern).
   • System prompt rides inside ``messages`` as ``role="system"`` rather
     than a separate top-level parameter.
+  • Reasoning is a separate delta channel, not a prefix on the content:
+    o-series sends ``delta.reasoning``, DeepSeek-R1 sends
+    ``delta.reasoning_content``. Both are streamed via ``on_reasoning``.
 """
 
 from __future__ import annotations
@@ -50,8 +69,11 @@ logger = logging.getLogger(__name__)
 # Backends that talk the OpenAI wire format. Mirrors
 # ``_OPENAI_COMPATIBLE`` in ``core/external_model.py`` so the slugs stay
 # consistent between the legacy code path and the new adapter.
+_OLLAMA_PROVIDERS: frozenset[str] = frozenset({"ollama", "ollama-cloud"})
+
 KNOWN_PROVIDERS: frozenset[str] = frozenset({
     "openai", "lmstudio", "ollama", "ollama-cloud", "gemini",
+    "openrouter", "groq", "deepseek", "vllm", "together",
 })
 
 # Local servers accept any non-empty key — supply a placeholder so the
@@ -59,6 +81,7 @@ KNOWN_PROVIDERS: frozenset[str] = frozenset({
 _LOCAL_PLACEHOLDER_KEYS: dict[str, str] = {
     "lmstudio": "lm-studio",
     "ollama": "ollama",
+    "vllm": "vllm",
 }
 
 
@@ -141,7 +164,16 @@ def _from_openai_tool_calls(raw_calls: Any) -> list[ToolCall]:
             try:
                 from jaeger_agent.dialects import repair_arguments
                 repaired, ok = repair_arguments(args_str)
-                if ok and isinstance(repaired, dict):
+                # Trust only lossless recovery. An empty dict from a
+                # non-empty blob, or a truncated payload we closed
+                # ourselves (recovered=False), must surface as
+                # ``_raw_arguments`` so the tool is not called with
+                # silently invented fields.
+                if (
+                    ok
+                    and isinstance(repaired, dict)
+                    and (repaired or not str(args_str).strip())
+                ):
                     arguments = repaired
                 else:
                     arguments = {"_raw_arguments": args_str}
@@ -150,6 +182,27 @@ def _from_openai_tool_calls(raw_calls: Any) -> list[ToolCall]:
 
         out.append({"id": tc_id, "name": name, "arguments": arguments})
     return out
+
+
+def _thinking_exhausted(raw: Any) -> bool:
+    """True when a completion hit its length cap inside reasoning: no
+    content, no tool calls, some reasoning."""
+    try:
+        choices = getattr(raw, "choices", None) or (raw.get("choices") if isinstance(raw, dict) else None) or []
+        if not choices:
+            return False
+        choice = choices[0]
+        finish = getattr(choice, "finish_reason", None) or (choice.get("finish_reason") if isinstance(choice, dict) else None)
+        message = getattr(choice, "message", None) or (choice.get("message") if isinstance(choice, dict) else {}) or {}
+        def field(name: str) -> Any:
+            value = getattr(message, name, None)
+            if value is None and isinstance(message, dict):
+                value = message.get(name)
+            return value
+        reasoning = field("reasoning") or field("reasoning_content")
+        return finish == "length" and bool(reasoning) and not (field("content") or "").strip() and not field("tool_calls")
+    except Exception:  # noqa: BLE001 — a probe, never a failure
+        return False
 
 
 class OpenAIAdapter(ProviderAdapter):
@@ -200,6 +253,7 @@ class OpenAIAdapter(ProviderAdapter):
         timeout_s: float = 60.0,
         stream_transport: bool = True,
         client: Any = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.provider = provider
         self.model = model
@@ -209,6 +263,8 @@ class OpenAIAdapter(ProviderAdapter):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.num_ctx = int(num_ctx) if num_ctx is not None else None
+        # ``reasoning_effort``: none|low|medium|high, or None to send nothing.
+        self.reasoning_effort = (str(reasoning_effort).strip().lower() or None) if reasoning_effort else None
         self.timeout_s = float(timeout_s)
         self.stream_transport = bool(stream_transport)
         self._client = client
@@ -238,7 +294,9 @@ class OpenAIAdapter(ProviderAdapter):
         if self._client is not None:
             return self._client
         from openai import OpenAI
-        kwargs: dict[str, Any] = {"timeout": self.timeout_s}
+        import httpx
+        timeout = httpx.Timeout(self.timeout_s, connect=10.0, read=self.timeout_s, write=30.0, pool=10.0)
+        kwargs: dict[str, Any] = {"timeout": timeout}
         key = self._resolve_key()
         if key:
             kwargs["api_key"] = key
@@ -313,11 +371,46 @@ class OpenAIAdapter(ProviderAdapter):
             and ":cloud" not in self.model.lower()
         ):
             kwargs["extra_body"] = {"options": {"num_ctx": self.num_ctx}}
+        if self.reasoning_effort:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         return kwargs
 
     # ── call + parse ────────────────────────────────────────────────
 
-    def call(
+    def call(self, formatted: Any, interrupt_event: threading.Event, **kwargs: Any) -> Any:
+        """One request; when the model spent the whole output budget
+        thinking and produced no answer or tool call, retry it once with
+        reasoning off (``reasoning_effort="none"``) instead of failing the
+        step. Only when this adapter is the one capping reasoning, or (for
+        Ollama providers at the provider default) once more at ``low``."""
+        raw = self._call_once(formatted, interrupt_event, **kwargs)
+        effort = (kwargs.get("reasoning_effort") or (formatted or {}).get("reasoning_effort")
+                  if isinstance(formatted, dict) else None)
+        if (
+            effort and effort != "none" and not interrupt_event.is_set()
+            and _thinking_exhausted(raw)
+        ):
+            retry = {**formatted, "reasoning_effort": "none"}
+            self.last_reasoning_retry = True
+            return self._call_once(retry, interrupt_event, **{k: v for k, v in kwargs.items() if k != "reasoning_effort"})
+        if (
+            not effort and self.provider in _OLLAMA_PROVIDERS
+            and isinstance(formatted, dict) and not interrupt_event.is_set()
+            and _thinking_exhausted(raw)
+        ):
+            # Ollama cloud models (glm-5.3-flash:cloud) keep the provider's
+            # default reasoning, which can spend a whole 4096-token step
+            # thinking on a ~26K-token tool prompt (2026-10-16 SOTA TERM-01:
+            # "spent its entire output budget thinking"). Ollama honours
+            # ``reasoning_effort`` for these models, so retry once at ``low``
+            # rather than failing the step.
+            retry = {**formatted, "reasoning_effort": "low"}
+            self.last_reasoning_retry = True
+            return self._call_once(retry, interrupt_event, **{k: v for k, v in kwargs.items() if k != "reasoning_effort"})
+        self.last_reasoning_retry = False
+        return raw
+
+    def _call_once(
         self,
         formatted: Any,
         interrupt_event: threading.Event,
@@ -328,6 +421,7 @@ class OpenAIAdapter(ProviderAdapter):
         join_on_abandon: float = 0.0,
         progress: CallProgress | None = None,
         on_delta: Any = None,
+        on_reasoning: Any = None,
         **kwargs: Any,
     ) -> Any:
         """Run one ``chat.completions.create`` request, interrupt-aware.
@@ -349,11 +443,12 @@ class OpenAIAdapter(ProviderAdapter):
         client = self._ensure_client()
         api_kwargs = {**formatted, **kwargs}
         self.last_ttft_s = None
+        effective_stale = stale_timeout if stale_timeout is not None else self.timeout_s
         if not self.stream_transport:
             return interruptible_call(
                 lambda: client.chat.completions.create(**api_kwargs),
                 interrupt_event,
-                stale_timeout=stale_timeout,
+                stale_timeout=effective_stale,
                 on_heartbeat=on_heartbeat,
                 on_abandon=on_abandon,
                 join_on_abandon=join_on_abandon,
@@ -362,12 +457,11 @@ class OpenAIAdapter(ProviderAdapter):
             )
 
         api_kwargs["stream"] = True
-        # ``stream_options`` is an OpenAI extension; compat servers
-        # (LM Studio, Ollama, Gemini-compat) may reject the unknown
-        # field, so only the real endpoint gets it. Without it the
-        # final usage block is absent and token accounting falls back
-        # to the loop's whitespace estimate — acceptable.
-        if self.provider == "openai" and "stream_options" not in api_kwargs:
+        # Current Ollama (0.32.6+) supports OpenAI's usage trailer too.
+        # Opt in so cloud billing uses the server's real token counts,
+        # including invisible reasoning tokens, rather than estimates.
+        # Other compatibility servers may still reject this extension.
+        if self.provider in {"openai", "ollama", "ollama-cloud"} and "stream_options" not in api_kwargs:
             api_kwargs["stream_options"] = {"include_usage": True}
         progress = progress or CallProgress()
         beacon = progress
@@ -375,14 +469,14 @@ class OpenAIAdapter(ProviderAdapter):
         def _streamed() -> Any:
             stream = client.chat.completions.create(**api_kwargs)
             return _aggregate_chat_stream(
-                stream, interrupt_event, beacon, on_delta,
+                stream, interrupt_event, beacon, on_delta, on_reasoning,
             )
 
         started = time.perf_counter()
         raw = interruptible_call(
             _streamed,
             interrupt_event,
-            stale_timeout=stale_timeout,
+            stale_timeout=effective_stale,
             on_heartbeat=on_heartbeat,
             on_abandon=on_abandon,
             join_on_abandon=join_on_abandon,
@@ -420,6 +514,16 @@ class OpenAIAdapter(ProviderAdapter):
         if raw_tool_calls is None and isinstance(message, dict):
             raw_tool_calls = message.get("tool_calls")
 
+        # OpenAI-compatible reasoning providers use both names in the wild:
+        # Ollama/Qwen commonly emits ``reasoning`` while DeepSeek-compatible
+        # endpoints often emit ``reasoning_content``. Preserve either under
+        # Jaeger's provider-neutral key so the bridge can surface it.
+        reasoning = getattr(message, "reasoning", None)
+        if reasoning is None:
+            reasoning = getattr(message, "reasoning_content", None)
+        if reasoning is None and isinstance(message, dict):
+            reasoning = message.get("reasoning") or message.get("reasoning_content")
+
         tool_calls = _from_openai_tool_calls(raw_tool_calls)
 
         usage = getattr(raw, "usage", None) or (
@@ -431,16 +535,24 @@ class OpenAIAdapter(ProviderAdapter):
                 "completion_tokens": _get(usage, "completion_tokens"),
                 "total_tokens": _get(usage, "total_tokens"),
             }
+            details = _get(usage, "prompt_tokens_details")
+            cached = _get(details, "cached_tokens") if details is not None else None
+            if cached is not None:
+                self.last_usage["cached_prompt_tokens"] = cached
 
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason is None and isinstance(choice, dict):
             finish_reason = choice.get("finish_reason")
 
         out: Message = {"role": "assistant", "content": content or None}
+        if reasoning:
+            out["reasoning"] = str(reasoning)
         if tool_calls:
             out["tool_calls"] = tool_calls
         if finish_reason:
             out["finish_reason"] = finish_reason
+        if finish_reason == "length" and reasoning and not content and not tool_calls:
+            out["finish_reason"] = "thinking_exhausted"
         return out
 
     # ── capabilities + health ───────────────────────────────────────
@@ -492,6 +604,7 @@ def _aggregate_chat_stream(
     interrupt_event: threading.Event,
     progress: CallProgress,
     on_delta: Any = None,
+    on_reasoning: Any = None,
 ) -> dict[str, Any]:
     """Drain a chat-completions stream into the non-streaming response
     shape ``parse_response`` reads.
@@ -509,6 +622,7 @@ def _aggregate_chat_stream(
     repairs it downstream exactly as in the non-streamed path.
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     calls_by_index: dict[int, dict[str, Any]] = {}
     finish_reason: Any = None
     usage: Any = None
@@ -534,6 +648,21 @@ def _aggregate_chat_stream(
                     content_parts.append(piece)
                     if on_delta is not None:
                         on_delta(piece)
+                reason_piece = _get(delta, "reasoning")
+                if reason_piece is None:
+                    reason_piece = _get(delta, "reasoning_content")
+                if reason_piece:
+                    reasoning_parts.append(str(reason_piece))
+                    # Reasoning is a SEPARATE channel, streamed as it arrives —
+                    # the same treatment `content` gets two lines up, and what
+                    # every reasoning-model API does (OpenAI o-series
+                    # `reasoning`, DeepSeek-R1 `reasoning_content`, Anthropic
+                    # thinking blocks). Accumulating it and emitting one lump
+                    # after the step finished meant a surface received the
+                    # answer first and the thinking behind it afterwards, which
+                    # is backwards and unreadable.
+                    if on_reasoning is not None:
+                        on_reasoning(str(reason_piece))
                 for tc in _get(delta, "tool_calls") or []:
                     idx = _get(tc, "index")
                     idx = 0 if idx is None else int(idx)
@@ -574,6 +703,8 @@ def _aggregate_chat_stream(
         "role": "assistant",
         "content": "".join(content_parts) or None,
     }
+    if reasoning_parts:
+        message["reasoning"] = "".join(reasoning_parts)
     if calls_by_index:
         message["tool_calls"] = [
             {

@@ -14,6 +14,7 @@ knowledge + procedure the agent executes with `terminal` / `execute_code`.
 
 from __future__ import annotations
 
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ from typing import Any
 # old walk landed on the repo root after the move. Skills ship
 # inside this package now, so resolve within it.
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
+_CATALOG_PATH = _SKILLS_DIR / "catalog.yaml"
 
 
 # Where a skill came from — for trust decisions and a future curator
@@ -47,8 +49,63 @@ class PlaybookSkill:
     # ``requires_toolsets`` auto-loads the named toolsets on `skill view`.
     platforms: list[str] = field(default_factory=list)
     requires_tools: list[str] = field(default_factory=list)
+    optional_tools: list[str] = field(default_factory=list)
     requires_toolsets: list[str] = field(default_factory=list)
+    requires_plugins: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    lifecycle: str = "core"
+    skill_class: str = "first-class"
+    auto_activate: bool = True
     tier: str = "standard"  # routing hint: native | preferred | standard | fallback
+
+
+_LIFECYCLE_ORDER = (
+    "core", "optional", "plugin", "explicit", "deprecated", "archived",
+)
+_VALID_LIFECYCLES = set(_LIFECYCLE_ORDER)
+_VALID_SKILL_CLASSES = {"first-class", "knowledge-pack"}
+
+
+def _jros_metadata(fm: dict[str, Any]) -> dict[str, Any]:
+    meta = fm.get("metadata")
+    if not isinstance(meta, dict):
+        return {}
+    block = meta.get("jros") or meta.get("jaeger")
+    return block if isinstance(block, dict) else {}
+
+
+def _meta_value(fm: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read a Jaeger extension from metadata first, then legacy top-level.
+
+    Both hyphenated Agent-Skills-style keys and the older underscore keys are
+    accepted during the v2 migration.
+    """
+    meta = _jros_metadata(fm)
+    for key in keys:
+        for candidate in (key, key.replace("_", "-"), key.replace("-", "_")):
+            if candidate in meta:
+                return meta[candidate]
+    for key in keys:
+        for candidate in (key, key.replace("_", "-"), key.replace("-", "_")):
+            if candidate in fm:
+                return fm[candidate]
+    return default
+
+
+def _meta_str_list(fm: dict[str, Any], key: str) -> list[str]:
+    value = _meta_value(fm, key, default=[])
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _meta_bool(fm: dict[str, Any], key: str, default: bool = True) -> bool:
+    value = _meta_value(fm, key, default=default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
 
 
 def read_skill_origin(folder: Path) -> str:
@@ -194,7 +251,34 @@ def _discovery_signature(roots: list[Path]) -> tuple:
                 sig.append((str(md), st.st_mtime, st.st_size))
             except OSError:
                 pass
+    try:
+        st = _CATALOG_PATH.stat()
+        sig.append((str(_CATALOG_PATH), st.st_mtime, st.st_size))
+    except OSError:
+        pass
     return tuple(sig)
+
+
+def _catalog_policy() -> tuple[dict[str, str], set[str]]:
+    """Return lifecycle overrides and knowledge-pack labels.
+
+    Catalog policy is deliberately separate from portable skill packages: it
+    controls what this Jaeger distribution exposes by default without rewriting
+    imported upstream SKILL.md files or discarding their domain knowledge.
+    """
+    try:
+        import yaml
+        raw = yaml.safe_load(_CATALOG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return {}, set()
+    lifecycle: dict[str, str] = {}
+    for state in _LIFECYCLE_ORDER:
+        names = raw.get(state) or []
+        if isinstance(names, list):
+            for name in names:
+                lifecycle[str(name)] = state
+    packs = raw.get("knowledge-packs") or []
+    return lifecycle, {str(name) for name in packs if str(name).strip()}
 
 
 def discover_playbooks() -> list[PlaybookSkill]:
@@ -215,6 +299,7 @@ def discover_playbooks() -> list[PlaybookSkill]:
         return _DISCOVERY_CACHE["result"]
 
     by_name: dict[str, PlaybookSkill] = {}
+    lifecycle_policy, knowledge_packs = _catalog_policy()
     for root in roots:                 # instance scanned last → it wins
         if not root.is_dir():
             continue
@@ -229,7 +314,9 @@ def discover_playbooks() -> list[PlaybookSkill]:
             except OSError:
                 continue
             fm = _parse_frontmatter(text)
-            if fm.get("archived"):
+            declared_lifecycle = _meta_value(fm, "lifecycle", default=None)
+            lifecycle = str(declared_lifecycle or "core").lower()
+            if fm.get("archived") or lifecycle == "archived":
                 continue  # retired skill — metadata flag, excluded from the surface
             try:
                 rel = folder.relative_to(root)
@@ -243,11 +330,33 @@ def discover_playbooks() -> list[PlaybookSkill]:
                 path=md,
                 tags=_tags_of(fm),
                 origin=read_skill_origin(folder),
-                platforms=_normalize_platforms(_str_list(fm, "platforms")),
-                requires_tools=_str_list(fm, "requires_tools"),
-                requires_toolsets=_str_list(fm, "requires_toolsets"),
-                tier=str(fm.get("tier") or "standard").strip().lower(),
+                platforms=_normalize_platforms(_meta_str_list(fm, "platforms")),
+                requires_tools=_meta_str_list(fm, "requires_tools"),
+                optional_tools=_meta_str_list(fm, "optional_tools"),
+                requires_toolsets=_meta_str_list(fm, "requires_toolsets"),
+                requires_plugins=_meta_str_list(fm, "requires_plugins"),
+                aliases=_meta_str_list(fm, "aliases"),
+                lifecycle=(lifecycle if lifecycle in _VALID_LIFECYCLES else "core"),
+                skill_class=str(
+                    _meta_value(fm, "skill_class", default="first-class")
+                ).strip().lower(),
+                auto_activate=_meta_bool(fm, "auto_activate", default=True),
+                tier=str(_meta_value(fm, "tier", default="standard")).strip().lower(),
             )
+            if skill.skill_class not in _VALID_SKILL_CLASSES:
+                skill.skill_class = "first-class"
+            if skill.name in lifecycle_policy:
+                skill.lifecycle = lifecycle_policy[skill.name]
+            elif root == _SKILLS_DIR and declared_lifecycle is None:
+                # The distribution catalog is the explicit prompt-visibility
+                # policy. A newly bundled skill remains installed, searchable,
+                # and explicitly loadable, but does not silently expand every
+                # model request's routing surface.
+                skill.lifecycle = "optional"
+            if skill.name in knowledge_packs:
+                skill.skill_class = "knowledge-pack"
+            if skill.lifecycle == "archived":
+                continue
             by_name[skill.name] = skill
     result = sorted(by_name.values(), key=lambda s: (s.category, s.name))
     _DISCOVERY_CACHE["sig"] = sig
@@ -263,7 +372,13 @@ def _select_available(
     for another OS, those disabled in config, and (when ``available_tools``
     is given) those whose ``requires_tools`` aren't all present, so a skill
     that needs an absent tool doesn't clutter the index."""
-    out = [s for s in skills if _platform_ok(s) and s.name not in disabled]
+    out = [
+        s for s in skills
+        if _platform_ok(s)
+        and s.name not in disabled
+        and s.lifecycle in {"core", "deprecated"}
+        and s.auto_activate
+    ]
     if available_tools is not None:
         out = [s for s in out if all(t in available_tools
                                      for t in s.requires_tools)]
@@ -280,6 +395,89 @@ def available_playbooks(
     :func:`discover_playbooks` is kept for internal callers (e.g. curation)."""
     return _select_available(discover_playbooks(), _disabled_playbook_names(),
                              available_tools)
+
+
+def callable_playbooks() -> list[PlaybookSkill]:
+    """Every installed skill the operator can discover and explicitly load.
+
+    Availability requirements remain metadata on the returned skill. They do
+    not erase a capability from discovery merely because a credential, plugin,
+    tool, or device is absent on this host.
+    """
+    disabled = _disabled_playbook_names()
+    return [
+        skill for skill in discover_playbooks()
+        if _platform_ok(skill) and skill.name not in disabled
+    ]
+
+
+_ROUTE_WORD = re.compile(r"[a-z0-9]+")
+_ROUTE_STOP = frozenset({
+    "a", "an", "and", "are", "for", "from", "in", "into", "is", "it",
+    "my", "of", "on", "or", "the", "this", "to", "use", "with", "you",
+})
+
+
+def _route_tokens(text: str) -> set[str]:
+    return {
+        token for token in _ROUTE_WORD.findall((text or "").lower())
+        if len(token) > 2 and token not in _ROUTE_STOP
+    }
+
+
+def match_playbook(
+    query: str,
+    *,
+    available_tools: set[str] | None = None,
+) -> tuple[PlaybookSkill | None, float, str]:
+    """Conservatively select one high-confidence playbook for a request.
+
+    Exact names/aliases win. Lexical matches need multiple weighted signals
+    and a clear margin over the runner-up, preventing a generic word such as
+    ``file`` from silently loading an unrelated long recipe.
+    """
+    blob = " ".join((query or "").lower().split())
+    if any(token in blob for token in (
+        "we are discussing", "just talk", "text discussion", "can you stop",
+        "i just want to see",
+    )) or blob.strip() in {"stop", "stop.", "we are discussing stop"}:
+        return None, 0.0, "conversational-stop"
+    clean = " ".join(_ROUTE_WORD.findall((query or "").lower()))
+    qtokens = _route_tokens(clean)
+    if not clean or not qtokens:
+        return None, 0.0, "empty"
+    scored: list[tuple[float, PlaybookSkill, str]] = []
+    for skill in available_playbooks(available_tools):
+        if skill.origin == "marketplace":
+            continue
+        # Planning-only recipes require an actual request for a plan. A
+        # substring in "implementation", or "do not stop at planning", is
+        # not authorization to replace implementation with a planning gate.
+        if skill.name == "plan" and not re.search(
+            r"^(?:/plan\b|(?:please )?(?:make|create|write|draft|give me|show me) (?:a |the )?plan\b)", blob,
+        ):
+            continue
+        names = [skill.name, *skill.aliases]
+        normalized_names = [" ".join(_ROUTE_WORD.findall(name.lower())) for name in names]
+        exact = next((name for name in normalized_names if name and f" {name} " in f" {clean} "), "")
+        if exact:
+            scored.append((100.0 + len(exact.split()), skill, f"exact phrase {exact!r}"))
+            continue
+        name_tokens = set().union(*(_route_tokens(name) for name in names))
+        desc_tokens = _route_tokens(f"{skill.description} {' '.join(skill.tags)} {skill.category}")
+        name_overlap = qtokens & name_tokens
+        desc_overlap = qtokens & desc_tokens
+        score = 6.0 * len(name_overlap) + 2.0 * len(desc_overlap)
+        if len(name_overlap | desc_overlap) >= 2 and score >= 8.0:
+            scored.append((score, skill, f"matched {sorted(name_overlap | desc_overlap)}"))
+    if not scored:
+        return None, 0.0, "no high-confidence match"
+    scored.sort(key=lambda row: (-row[0], row[1].name))
+    best = scored[0]
+    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+    if best[0] < 100.0 and best[0] - runner_up < 2.0:
+        return None, best[0], "ambiguous match"
+    return best[1], best[0], best[2]
 
 
 
@@ -311,13 +509,20 @@ def build_skill_index(available_tools: set[str] | None = None) -> str:
 
 
 def find_playbook(name: str) -> PlaybookSkill | None:
-    """Resolve a playbook by exact then substring name match."""
+    """Resolve explicit requests across core and optional skills and aliases."""
     needle = (name or "").strip().lower()
     if not needle:
         return None
-    skills = available_playbooks()
+    disabled = _disabled_playbook_names()
+    skills = [
+        s for s in discover_playbooks()
+        if _platform_ok(s) and s.name not in disabled
+    ]
     for s in skills:
         if s.name.lower() == needle:
+            return s
+    for s in skills:
+        if needle in {alias.lower() for alias in s.aliases}:
             return s
     for s in skills:
         if needle in s.name.lower():

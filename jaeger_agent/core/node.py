@@ -69,9 +69,9 @@ class MindNode(Node):
         self.bridge = AgentBridge(
             bus=self.bus,
             runtime=self.runtime,
-            publish=self.publish,
-            subscribe=self.subscribe,
-            unsubscribe=self.unsubscribe,
+            publish=self.bus.publish,
+            subscribe=self.bus.subscribe,
+            unsubscribe=self.bus.unsubscribe,
             session_key=str(self.config.get("session_key", "default")),
             max_queue=int(self.config.get("max_queue", 32)),
         )
@@ -81,7 +81,14 @@ class MindNode(Node):
         if self.bridge is not None:
             try:
                 self.bridge.close()
-            except Exception:  # noqa: BLE001 - node teardown is best effort
+            except Exception as exc:  # noqa: BLE001 - teardown is best effort
+                self._error = exc
+        if self.runtime is not None:
+            try:
+                close_fn = getattr(self.runtime, "close", None)
+                if callable(close_fn):
+                    close_fn()
+            except Exception:
                 pass
 
     def health(self) -> dict[str, Any]:

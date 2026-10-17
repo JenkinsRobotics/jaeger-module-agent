@@ -17,6 +17,7 @@ constructs its own ``JaegerAgent``.
 
 from __future__ import annotations
 
+import logging
 import re as _re
 import threading
 import time
@@ -24,18 +25,26 @@ from typing import Any
 
 from typing import Callable
 
+logger = logging.getLogger(__name__)
+
 from jaeger_agent.adapters.base import ProviderAdapter
 from jaeger_agent.core.cancellation import bind_turn_cancellation, current_cancellation
 from jaeger_agent.loop.callbacks import AgentCallbacks
 from jaeger_agent.loop.interrupt import AgentInterrupted, StaleCallTimeout
 from jaeger_agent.loop import verify_gate
 from jaeger_agent.loop.loop_backstop import (
+    MAX_TOOL_CALLS,
     call_signature,
+    collapse_generated_repetition,
     loop_halt_reason,
     loop_warning,
     semantic_failure_signature,
+    tool_budget_warning,
 )
+from jaeger_agent.loop.tool_result_safety import protect_tool_result
+from jaeger_agent.loop.turn_budget import TurnBudget, TurnBudgetLimits
 from jaeger_agent.schemas.message_types import Message, ToolCall
+from jaeger_agent.tool_executor import ToolExecutor
 from jaeger_os.core.tools.tool_registry import get_tools
 from jaeger_os.core.tools.tool_schema import ToolDef, dev_mode_enabled
 from jaeger_agent.util.context_guard import ContextGuard, ContextOverflow
@@ -48,6 +57,53 @@ from jaeger_agent.util.context_guard import ContextGuard, ContextOverflow
 # here so the answer reads as a natural sentence.
 SkipFinalFinalizer = Callable[[str, "object", str], str]
 ToolsetResolver = Callable[[set[str]], set[str]]
+
+
+def _default_tool_executor() -> ToolExecutor:
+    """Ledger-backed executor is the production composition.
+
+    SQLite when the instance store is bound; an in-memory ledger
+    otherwise so tests and embedders still get at-most-once within
+    the process without requiring a database.
+    """
+    from jaeger_agent.cognition.effects import InMemoryEffectLedger
+    from jaeger_agent.memory import sqlite_store
+    from jaeger_agent.tool_executor import (
+        CheckpointingToolExecutor, DirectToolExecutor, HookedToolExecutor,
+        LedgerToolExecutor,
+    )
+
+    if sqlite_store.is_bound():
+        from jaeger_agent.cognition.sqlite_runs import SqliteEffectLedger
+        ledger: Any = SqliteEffectLedger()
+    else:
+        ledger = InMemoryEffectLedger()
+    # Hooks wrap the ledger, never the reverse: a pre_tool_call veto has to
+    # stop the call BEFORE ``EffectLedger.once`` claims its key, or the block
+    # would burn that key and the retry after the operator fixes their hook
+    # would come back as a duplicate instead of running.
+    #
+    # Zero cost when unconfigured — ``shell_hooks.fire`` returns immediately
+    # unless the instance config enables hooks.
+    # hooks → checkpoints → ledger → direct.
+    #   hooks outermost   : a vetoed call costs neither a snapshot nor a key
+    #   checkpoints next  : the snapshot must precede the effect
+    #   ledger innermost  : at-most-once wraps only the real execution
+    # Both new layers are inert unless enabled in the instance config.
+    return HookedToolExecutor(
+        CheckpointingToolExecutor(
+            LedgerToolExecutor(ledger, DirectToolExecutor())))
+
+
+def _open_or_create_run(agent: "JaegerAgent") -> str:
+    """Ephemeral run id for this agent instance.
+
+    Persistence is ``TurnExecutive``'s job: the loop must not import
+    SQLite. A host that binds a run before ``run_turn`` keeps that id
+    across turns, retries and provider swaps.
+    """
+    from jaeger_agent.cognition.runs import new_id
+    return new_id()
 ToolVisibility = Callable[[str], bool]
 TurnStartHook = Callable[[], None]
 
@@ -121,10 +177,17 @@ class JaegerAgent:
         toolset_resolver: ToolsetResolver | None = None,
         tool_visibility: ToolVisibility | None = None,
         turn_start_hook: TurnStartHook | None = None,
+        tool_executor: ToolExecutor | None = None,
+        turn_budget_limits: TurnBudgetLimits | None = None,
     ) -> None:
         self.primary_adapter = adapter
         self.fallback_adapters: list[ProviderAdapter] = list(fallback_adapters or [])
         self.system_prompt = system_prompt
+        from jaeger_agent.tool_executor import active_tool_allowlist
+        self.allowed_tools = active_tool_allowlist()
+        if self.allowed_tools is not None:
+            tools = [tool for tool in (tools if tools is not None else get_tools())
+                     if tool.name in self.allowed_tools]
         # Tool selection precedence:
         #   1. explicit ``tools=`` list  — caller picks exact ToolDefs
         #   2. ``toolsets={...}`` set    — pick by category; resolve to names
@@ -165,19 +228,22 @@ class JaegerAgent:
         if tools is not None:
             self._all_tools: list[ToolDef] = list(tools)
             self._tools_filter_locked = True   # explicit list = caller knows best
+            self._tools_filter_locked_reason = "allowlist"
         elif toolsets is not None:
             if self._toolset_resolver is None:
                 raise ValueError(
                     "toolsets require a toolset_resolver supplied by the host application"
                 )
             wanted = self._toolset_resolver(set(toolsets))
-            self._all_tools = _exclude_beta(
+            self._all_tools = _filter_available_tools(
                 [t for t in get_tools() if t.name in wanted]
             )
             self._tools_filter_locked = False
+            self._tools_filter_locked_reason = None
         else:
-            self._all_tools = _exclude_beta(get_tools())
+            self._all_tools = _filter_available_tools(get_tools())
             self._tools_filter_locked = False
+            self._tools_filter_locked_reason = None
         # Per-agent dispatch map. ``_dispatch_one_tool`` previously
         # resolved by name against the *global* registry — so an agent
         # built with ``tools=[a, b, c]`` (an explicit allowlist) would
@@ -190,11 +256,28 @@ class JaegerAgent:
         self._dispatch_by_name: dict[str, ToolDef] = {
             t.name: t for t in self._all_tools
         }
+        # Per-agent, monotonically growing intent-selected surface. Unlike
+        # the legacy module-level active set, this cannot leak one session's
+        # privileged tool choices into another concurrent agent.
+        self._intent_tool_names: set[str] = set()
         # Record the originally-requested toolset names for diagnostics
         # (the ``/runtime`` panel surfaces this); not used by the loop.
         self.toolsets: frozenset[str] = frozenset(toolsets or ())
         self.max_iterations = int(max_iterations)
+        self.turn_budget = TurnBudget(turn_budget_limits or TurnBudgetLimits(
+            max_tool_calls=MAX_TOOL_CALLS,
+            max_iterations=self.max_iterations,
+        ))
         self.callbacks = callbacks or AgentCallbacks()
+        self._run_id: str | None = None
+        #: Set when an adapter streams reasoning for the current step, so the
+        #: post-step fallback does not repeat what was already sent.
+        self._streamed_reasoning = False
+        self._effect_checkpoint: Callable[[str, dict[str, Any], dict[str, Any]], None] | None = None
+        self._tool_executor: ToolExecutor = tool_executor or _default_tool_executor()
+        if self.allowed_tools is not None:
+            from jaeger_agent.tool_executor import AllowlistToolExecutor
+            self._tool_executor = AllowlistToolExecutor(self._tool_executor, self.allowed_tools)
 
         # Skip-final: tools whose dict result IS the answer (``get_time``,
         # ``recall``, ``calculate``, …). When the turn's first model
@@ -233,6 +316,9 @@ class JaegerAgent:
         # ``last_turn_messages`` for the per-turn slice.
         self._turn_messages: list[Message] = []
         self._interrupt_event = threading.Event()
+        # Externally owned cancel signal (e.g. a host's per-request scope).
+        # Never cleared by this loop — see bind_cancel_signal.
+        self._cancel_signal: threading.Event | None = None
 
         # Loop-backstop counters. Reset at the start of every turn so a
         # spinning previous turn can't carry over and trip the new one.
@@ -248,13 +334,21 @@ class JaegerAgent:
         # repeat with the SAME result counts toward the identical-call
         # halt. Write-side tools keep the strict pre-dispatch count.
         self._read_result_hashes: dict[str, str] = {}
+        # Conservative cross-iteration cache for immutable-looking metadata
+        # reads. Any write/external call invalidates it. Polling/status tools
+        # are deliberately absent so changing state is still observed.
+        self._read_result_cache: dict[str, Any] = {}
         # Verify gate (station 2 — see loop/verify_gate.py): tool names
         # that SUCCEEDED this turn (feeds the claim-vs-action check) and
         # the once-per-turn nudge latch. ``_pending_nudge_text`` is
         # whichever synthetic nudge is currently in history awaiting
         # removal (post-tool or verify — they share the lifecycle).
         self._turn_tool_successes: set[str] = set()
+        self._turn_skill_names: set[str] = set()
+        self._turn_tool_names: list[str] = []
+        self.last_skill_route: dict[str, Any] | None = None
         self._verify_nudge_used = False
+        self._tool_budget_warning_used = False
         self._pending_nudge_text: str | None = None
 
         # Diagnostic surface — populated by the most recent ``run_turn``.
@@ -297,7 +391,7 @@ class JaegerAgent:
 
         Recomputed on every access so a mid-session ``load_tools``
         call (which mutates the shared visibility state in
-        :mod:`jaeger_os.agent.skill_registry.toolset_scoping`) takes effect on the
+        :mod:`jaeger_agent.skill_registry.toolset_scoping`) takes effect on the
         next turn without rebuilding the agent. The full set the agent
         can dispatch + validate against lives in ``self._all_tools`` —
         ``describe_tool`` reads from there so the model can peek at a
@@ -308,7 +402,8 @@ class JaegerAgent:
         elif self._tool_visibility is None:
             visible = list(self._all_tools)
         else:
-            visible = [t for t in self._all_tools if self._tool_visibility(t.name)]
+            visible = [t for t in self._all_tools
+                       if t.name in self._intent_tool_names or self._tool_visibility(t.name)]
 
         # Final-output speech in a multimodal face is a typed response channel,
         # not an agent tool. Exclude both current and legacy spellings even from
@@ -335,6 +430,45 @@ class JaegerAgent:
         return list(self._all_tools)
 
     # ── public surface ──────────────────────────────────────────────
+
+    @property
+    def run_id(self) -> str | None:
+        """Durable id of the run this agent is currently discharging."""
+        return self._run_id
+
+    def bind_run(self, run_id: str | None) -> None:
+        """Attach this agent to an existing run (resume / host-owned)."""
+        self._run_id = run_id
+        binder = getattr(self._tool_executor, "bind_run", None)
+        if callable(binder):
+            binder(run_id)
+
+    def set_effect_checkpoint(
+        self, fn: Callable[[str, dict[str, Any], dict[str, Any]], None] | None
+    ) -> None:
+        """Called after each non-read tool result is appended.
+
+        The callback receives the finalized, JSON-safe transcript message so
+        a crash mid-turn does not lose evidence of a completed mutation. The
+        executive owns the durable write.
+        """
+        self._effect_checkpoint = fn
+
+    def _emit_streamed_reasoning(self, chunk: str) -> None:
+        """Forward one reasoning delta and remember that we did.
+
+        The flag is what keeps the post-step fallback from emitting the same
+        deliberation a second time once the adapter has already streamed it.
+        """
+        self._streamed_reasoning = True
+        self.callbacks.on_reasoning(chunk)
+
+    def _bind_turn_run(self) -> None:
+        if self._run_id is None:
+            self._ephemeral_run = True
+            self.bind_run(_open_or_create_run(self))
+        else:
+            self._ephemeral_run = False
 
     @bind_turn_cancellation
     def run_turn(self, user_message: str, *, content: Any = None) -> str:
@@ -374,19 +508,45 @@ class JaegerAgent:
             appends a ``[turn failed: …]`` assistant note, then
             re-raises for the caller to surface.
         """
+        # Hermes-style focus profile: widen this agent's visible surface for
+        # obvious intent before the first model call. The set only grows for
+        # the session, preserving prompt-prefix/KV stability.
+        if not self._tools_filter_locked and self._toolset_resolver is not None:
+            try:
+                from jaeger_agent.skill_registry.toolset_scoping import (
+                    _scoping_enabled, infer_toolsets,
+                )
+                if _scoping_enabled():
+                    selected = infer_toolsets(user_message)
+                    if selected:
+                        self._intent_tool_names.update(
+                            self._toolset_resolver(selected)
+                        )
+            except Exception:  # noqa: BLE001 — routing hints must fail open
+                pass
+
         # Fresh per-turn state. Counters from a previous turn would
         # falsely trip the backstop on the second message of a session.
         self._call_signature_counts.clear()
         self._failure_signature_counts.clear()
         self._read_result_hashes.clear()
+        self._read_result_cache.clear()
         if current_cancellation() is None:
             self._interrupt_event.clear()
+            if self._cancel_signal is not None and self._cancel_signal.is_set():
+                # Cancelled before this turn started: the per-turn reset above
+                # must not swallow a signal the host owns.
+                self._interrupt_event.set()
         self._turn_messages = []
         self._post_tool_nudge_used = False
         self._nudge_pending = False
         self._pending_nudge_text = None
         self._turn_tool_successes.clear()
+        self._turn_skill_names.clear()
+        self._turn_tool_names.clear()
+        self.last_skill_route = None
         self._verify_nudge_used = False
+        self._tool_budget_warning_used = False
         self._failed_mutations.clear()
         self.last_halt_reason = None
         self.last_iteration_count = 0
@@ -394,12 +554,20 @@ class JaegerAgent:
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_ttft_s = None
+        self.turn_budget.reset()
 
         # Pick up tools registered since construction (a skill
         # activated mid-session) so they're visible AND dispatchable
         # without rebuilding the agent. No-op for explicit ``tools=``
         # agents.
+        # Overflow slim-to-CORE is emergency for one turn only; allowlist
+        # locks stay. Otherwise non-CORE tools stay unknown forever.
+        if getattr(self, "_tools_filter_locked_reason", None) == "overflow":
+            self._tools_filter_locked = False
+            self._tools_filter_locked_reason = None
+            self._overflow_tools_slimmed = False
         self._refresh_tool_catalog()
+        self._bind_turn_run()
 
         # Per-turn dedupe trackers in tool modules (file_read's
         # "unchanged since last read" suppression in particular). The
@@ -412,16 +580,36 @@ class JaegerAgent:
             except Exception:  # noqa: BLE001 — a host hook must not break a turn
                 pass
 
-        self._append_message({
-            "role": "user",
-            "content": user_message if content is None else content,
-        })
+        model_user_message = self._auto_route_skill(user_message) if content is None else content
+        self._append_message({"role": "user", "content": model_user_message})
         self._turn_active = True
         try:
             return self._run_turn_inner(user_message)
         except ContextOverflow:
+            # Try middle-out trajectory compression before giving up or re-raising
+            try:
+                from jaeger_agent.util.trajectory_compressor import compress_trajectory_if_needed
+                compressed = compress_trajectory_if_needed(self.messages)
+                if len(compressed) < len(self.messages):
+                    self.messages = compressed
+                    # Retry inner turn once with compressed context
+                    return self._run_turn_inner(user_message)
+            except Exception:
+                pass
+
             if len(self._turn_messages) <= 1:
-                # Pre-flight refusal — the model never saw this turn.
+                # Pre-flight refusal — often the FULL tool-schema JSON alone
+                # exceeds a small local model's usable prompt room (~34k
+                # tokens with every toolset active). Slim to CORE once and
+                # retry before rolling the user message back.
+                if self._slim_tools_to_core_for_overflow():
+                    try:
+                        self.callbacks.on_thinking(
+                            "[context-guard] slimmed tool schemas to CORE to fit ctx budget"
+                        )
+                    except Exception:
+                        pass
+                    return self._run_turn_inner(user_message)
                 # Roll the user message back so a too-big prompt isn't
                 # sticky: with it left in place, every later turn
                 # re-fails on the same un-trimmable history.
@@ -463,12 +651,21 @@ class JaegerAgent:
             raise
         finally:
             self._turn_active = False
+            self._record_skill_outcomes()
+            if getattr(self, "_ephemeral_run", False):
+                self.bind_run(None)
 
     def _run_turn_inner(self, user_message: str) -> str:
         """The actual loop body — see :meth:`run_turn` for the contract."""
         tool_calls_made = 0
+        max_tool_calls = self.turn_budget.limits.max_tool_calls
         for iteration in range(1, self.max_iterations + 1):
             self.last_iteration_count = iteration
+            self.turn_budget.observe_iteration(iteration)
+            boundary_halt = self.turn_budget.halt_reason()
+            if boundary_halt and "max_iterations" not in boundary_halt:
+                self.last_halt_reason = boundary_halt
+                return self._budget_halt_or_stop(boundary_halt)
 
             if self._interrupt_event.is_set():
                 self.last_halt_reason = "interrupted"
@@ -485,6 +682,22 @@ class JaegerAgent:
             # final assistant message after the retry chain settles.
             assistant_msg = self._one_model_step_with_length_retry()
 
+            # MODEL deliberation, if the adapter separated any out of the
+            # visible answer. Fired here rather than inside the adapter so
+            # every adapter that records ``reasoning`` on its message gets the
+            # behaviour for free, and so a surface sees it in turn order —
+            # before the tool calls the deliberation led to.
+            # Fallback ONLY. Adapters that stream reasoning have already sent
+            # it token by token, so re-emitting the finished block here would
+            # show the same thinking twice. Adapters that cannot stream it
+            # (no reasoning channel on the wire) still surface it this way,
+            # which is why the branch stays.
+            if isinstance(assistant_msg, dict) and not self._streamed_reasoning:
+                deliberation = assistant_msg.get("reasoning")
+                if deliberation:
+                    self.callbacks.on_reasoning(str(deliberation))
+            self._streamed_reasoning = False
+
             # The post-tool nudge (below) is synthetic — once the model
             # has seen it, take it back off the history so the visible
             # transcript carries only real turns.
@@ -499,6 +712,46 @@ class JaegerAgent:
             # always append before deciding next steps.
             tool_calls = assistant_msg.get("tool_calls") or []
             final_text = assistant_msg.get("content") or ""
+            if not tool_calls and final_text:
+                # OpenClaw-grade plain-text tool-call recovery:
+                # Local or open models (Ollama, DeepSeek, Qwen) often emit tool
+                # calls as plain text (<tool_call>, <function=...>, [call: ...],
+                # or markdown JSON). If no structured tool_calls were emitted,
+                # attempt repair before assuming the model finished speaking.
+                try:
+                    from jaeger_agent.parsing.tool_call_repair import repair_plain_text_tool_calls
+
+                    allowed_names = (
+                        {getattr(t, "name", "") for t in (self.tools or []) if getattr(t, "name", "")}
+                        or None
+                    )
+                    repaired_calls, scrubbed_text = repair_plain_text_tool_calls(
+                        final_text,
+                        allowed_tool_names=allowed_names,
+                    )
+                    if repaired_calls:
+                        tool_calls = repaired_calls
+                        final_text = scrubbed_text
+                        assistant_msg = {
+                            **assistant_msg,
+                            "tool_calls": tool_calls,
+                            "content": scrubbed_text,
+                        }
+                        self.callbacks.on_thinking(
+                            f"[promoted {len(tool_calls)} plain-text tool call(s) to execution]"
+                        )
+                except Exception as exc:
+                    logger.debug("tool_call_repair error: %s", exc)
+
+            if not tool_calls and final_text:
+                guarded_text, repetitions = collapse_generated_repetition(final_text)
+                if repetitions > 1:
+                    final_text = guarded_text
+                    assistant_msg = {**assistant_msg, "content": guarded_text}
+                    self.last_halt_reason = "repetitive_generated_response"
+                    self.callbacks.on_thinking(
+                        f"[repetition guard — collapsed {repetitions} identical response blocks]"
+                    )
             if not tool_calls and not final_text.strip():
                 # Reasoning budget exhausted: the model spent its whole
                 # output allowance inside <think> and never surfaced an
@@ -508,8 +761,10 @@ class JaegerAgent:
                 if assistant_msg.get("finish_reason") == "thinking_exhausted":
                     note = (
                         "[the model spent its entire output budget "
-                        "thinking and never reached an answer — ask "
-                        "more narrowly, or raise model.max_tokens]"
+                        "thinking and never reached an answer — the task "
+                        "is incomplete. Adjust the active model's output "
+                        "budget (external_model.max_tokens for cloud/API "
+                        "models; model.max_tokens for in-process models).]"
                     )
                     exhausted = {**assistant_msg, "content": note}
                     self._append_message(exhausted)
@@ -599,6 +854,7 @@ class JaegerAgent:
             ):
                 tc = tool_calls[0]
                 tool_calls_made += 1
+                self.turn_budget.consume_tool(cost=self._normalized_tool_cost(tc))
                 self._dispatch_one_tool(tc)
                 # The result lives on the just-appended tool message.
                 tool_msg = self.messages[-1]
@@ -622,8 +878,15 @@ class JaegerAgent:
             # to the provably safe subset). Anything else stays
             # sequential.
             if self._batch_is_parallel_safe(tool_calls):
-                tool_calls_made += len(tool_calls)
-                self._dispatch_parallel(tool_calls)
+                remaining = max(0, max_tool_calls - tool_calls_made)
+                allowed, refused = tool_calls[:remaining], tool_calls[remaining:]
+                if allowed:
+                    tool_calls_made += len(allowed)
+                    self.turn_budget.consume_tool(count=len(allowed), cost=float(len(allowed)))
+                    self._dispatch_parallel(allowed)
+                for tc in refused:
+                    self._append_budget_refusal(tc)
+                self._attach_tool_budget_warning(tool_calls_made)
                 if self._interrupt_event.is_set():
                     self.last_halt_reason = "interrupted"
                     return self._halt_turn()
@@ -631,15 +894,23 @@ class JaegerAgent:
                     tool_calls_made,
                     self._call_signature_counts,
                     self._failure_signature_counts,
+                    max_tool_calls=max_tool_calls,
                 )
                 if halt:
                     self.last_halt_reason = halt
-                    return self._halt_turn()
+                    return self._budget_halt_or_stop(halt)
                 continue
 
             seen_in_batch: dict[str, str] = {}
             for tc in tool_calls:
+                if tool_calls_made >= max_tool_calls:
+                    self._append_budget_refusal(tc)
+                    self.last_halt_reason = (
+                        f"made {tool_calls_made} tool calls in a single turn"
+                    )
+                    continue
                 tool_calls_made += 1
+                self.turn_budget.consume_tool(cost=self._normalized_tool_cost(tc))
                 if self._interrupt_event.is_set():
                     self.last_halt_reason = "interrupted"
                     return self._halt_turn()
@@ -679,10 +950,16 @@ class JaegerAgent:
                     tool_calls_made,
                     self._call_signature_counts,
                     self._failure_signature_counts,
+                    max_tool_calls=max_tool_calls,
                 )
                 if halt:
                     self.last_halt_reason = halt
-                    return self._halt_turn()
+                    return self._budget_halt_or_stop(halt)
+
+                self._attach_tool_budget_warning(tool_calls_made)
+
+            if self.last_halt_reason:
+                return self._budget_halt_or_stop(self.last_halt_reason)
 
         # Fell out of the for-loop: max_iterations exhausted with the
         # model still trying to use tools. Spend ONE toolless grace
@@ -739,6 +1016,18 @@ class JaegerAgent:
                 f"[mid-turn steer injected: {text[:80]}]"
             )
 
+    def bind_cancel_signal(self, signal: threading.Event | None) -> None:
+        """Honour a host-owned cancellation signal for this agent's turns.
+
+        Unlike the agent's own interrupt event, which ``run_turn`` resets at
+        the top of every turn so a stale barge-in cannot kill the next one,
+        this signal is never cleared here: a host that cancels a request
+        before (or while) its turn starts still gets an interrupted turn.
+        The host should also call :meth:`interrupt` when it cancels, so an
+        in-flight provider call is woken immediately.
+        """
+        self._cancel_signal = signal
+
     def reset_interrupt(self) -> None:
         """Clear the interrupt event manually. ``run_turn`` does this on
         entry too, so calling here is only needed by code that wants to
@@ -771,6 +1060,92 @@ class JaegerAgent:
         return [t.name for t in self.tools]
 
     # ── internals ───────────────────────────────────────────────────
+
+    def _auto_route_skill(self, user_message: str) -> str:
+        """Inject one high-confidence recipe before the first model step."""
+        import os
+
+        query = self.__dict__.pop("_skill_route_query", user_message)
+        if not query:
+            return user_message
+        if os.environ.get("JAEGER_AUTO_SKILLS", "1").strip() == "0":
+            return user_message
+        try:
+            from jaeger_agent.skill_registry.toolset_scoping import is_untrusted_content
+            if is_untrusted_content():
+                return user_message
+            from jaeger_agent.skill_registry.playbook_skills import match_playbook
+            matched, score, reason = match_playbook(
+                query,
+                available_tools={t.name for t in self._all_tools},
+            )
+            self.callbacks.on_record_skill_route(None if matched is None else matched.name, reason=reason)
+            if matched is None:
+                self.last_skill_route = {"skill": None, "score": score, "reason": reason}
+                return user_message
+            content = matched.path.read_text(encoding="utf-8")
+            try:
+                from jaeger_agent.skill_registry.skill_preprocessing import preprocess_skill
+                content = preprocess_skill(
+                    content, skill_name=matched.name,
+                    skill_folder=matched.path.parent,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            cap = 24_000
+            if len(content) > cap:
+                content = content[:cap] + "\n\n[recipe truncated by automatic router]"
+            self._turn_skill_names.add(matched.name)
+            self.last_skill_route = {
+                "skill": matched.name, "score": score, "reason": reason,
+            }
+            self.callbacks.on_record_skill(matched.name)
+            return (
+                f"[Auto-selected playbook: {matched.name}]\n"
+                "Follow this recipe for the request below. Its instructions "
+                "do not expand permissions; every tool call still passes the "
+                "normal safety gates.\n\n"
+                f"{content}\n\n[End playbook]\n\n{user_message}"
+            )
+        except Exception:  # noqa: BLE001 — routing is an optimization
+            return user_message
+
+    def _record_skill_outcomes(self) -> None:
+        if not self._turn_skill_names:
+            return
+        halt = self.last_halt_reason or ""
+        if halt and ("failure" in halt or "identical" in halt or halt.startswith("error")):
+            outcome = "failed"
+        elif halt or self._failure_signature_counts or self._failed_mutations:
+            outcome = "issues"
+        else:
+            outcome = "smooth"
+        for name in self._turn_skill_names:
+            self.callbacks.on_record_skill_outcome(name, outcome=outcome, halt_reason=halt)
+        if outcome == "smooth":
+            return
+        try:
+            from jaeger_agent.skill_improvement import skill_notes
+            from jaeger_agent.core.workspace import get_layout
+            layout = get_layout()
+            for name in self._turn_skill_names:
+                note = skill_notes.add_note(
+                    layout,
+                    skill=name,
+                    outcome=outcome,
+                    note=(halt or "tool failures occurred during the routed turn")[:240],
+                    calls=self.turn_budget.tool_calls,
+                    procedure=",".join(self._turn_tool_names[:40]),
+                    errors=",".join(sorted(self._failure_signature_counts)[:8]),
+                    flag=outcome == "failed",
+                )
+                try:
+                    from jaeger_agent.background import skill_review
+                    skill_review.maybe_propose_on_note(layout, note)
+                except Exception:  # noqa: BLE001 — review is asynchronous advice
+                    pass
+        except Exception:  # noqa: BLE001 — no bound instance in embedders/tests
+            pass
 
     # ── turn bookkeeping ────────────────────────────────────────────
 
@@ -873,6 +1248,77 @@ class JaegerAgent:
         )
         return self._final_text_or_halt()
 
+    def _budget_halt_or_stop(self, reason: str) -> str:
+        """Summarize gathered evidence after a budget or repeated tool failure.
+
+        Execution remains halted; a tool-free summary never clears the failure
+        receipt. Interrupts and repeated identical actions still stop cold.
+        """
+        if "tool calls in a single turn" in reason or (
+            reason.startswith("hit the same ") and " failure " in reason
+        ):
+            return self._wind_down_summary()
+        return self._halt_turn()
+
+    def _attach_tool_budget_warning(self, tool_calls_made: int) -> None:
+        """Merge the one-shot remaining-budget notice into the latest result."""
+        if self._tool_budget_warning_used:
+            return
+        warnings = [item for item in (
+            tool_budget_warning(
+                tool_calls_made,
+                max_tool_calls=self.turn_budget.limits.max_tool_calls,
+                warning_fraction=self.turn_budget.limits.warning_fraction,
+            ),
+            self.turn_budget.warning(),
+        ) if item]
+        warning = "\n".join(dict.fromkeys(warnings))
+        if not warning:
+            return
+        for message in reversed(self._turn_messages):
+            if message.get("role") == "tool":
+                message["content"] = _merge_guidance(
+                    message.get("content") or "", warning,
+                )
+                self._tool_budget_warning_used = True
+                self.callbacks.on_thinking(
+                    "[tool budget warning — "
+                    f"{self.turn_budget.limits.max_tool_calls - tool_calls_made} "
+                    "calls remain]"
+                )
+                return
+
+    def _normalized_tool_cost(self, tc: ToolCall) -> float:
+        """Return deterministic cost units when a tool has no price metadata.
+
+        Read-only work costs 1, local writes 2, and externally visible or
+        hardware actions 3. This is not a currency claim; hosts may supply a
+        tighter ``max_tool_cost`` policy while every run gets comparable
+        telemetry today.
+        """
+        tdef = self._dispatch_by_name.get(tc.get("name") or "")
+        side_effect = getattr(tdef, "side_effect", "") if tdef else ""
+        return {"read": 1.0, "write": 2.0, "external": 3.0, "hardware": 3.0}.get(side_effect, 2.0)
+
+    def _append_budget_refusal(self, tc: ToolCall) -> None:
+        """Close a model-emitted call without executing past the hard cap."""
+        self._append_message({
+            "role": "tool",
+            "tool_call_id": tc.get("id") or "",
+            "name": tc.get("name") or "",
+            "content": _stringify({
+                "ok": False,
+                "success": False,
+                "executed": False,
+                "error_code": "tool_budget_exhausted",
+                "error": (
+                    "hard limit of "
+                    f"{self.turn_budget.limits.max_tool_calls} tool calls reached"
+                ),
+                "retryable": False,
+            }),
+        })
+
     def _discard_pending_nudge(self) -> None:
         """Remove the synthetic nudge (post-tool OR verify-gate) from
         history once the model has answered it (or the turn is bailing).
@@ -896,7 +1342,7 @@ class JaegerAgent:
         halt path."""
         self._close_dangling_tool_calls(self.last_halt_reason or "budget")
         self._append_message({
-            "role": "user", "content": self._WIND_DOWN_PROMPT,
+            "role": "user", "content": f"Execution stopped: {self.last_halt_reason}.\n{self._WIND_DOWN_PROMPT}",
         })
         self.callbacks.on_thinking(
             "[iteration budget exhausted — asking the model to wrap up]"
@@ -905,10 +1351,24 @@ class JaegerAgent:
         prev_tools = self._all_tools
         self._tools_filter_locked = True
         self._all_tools = []
+        msg = None
         try:
-            msg = self._one_model_step()
-        except Exception:  # noqa: BLE001 — grace call is best-effort
-            msg = None
+            # Hermes' bounded finalizer retries once because an empty or
+            # transiently failed synthesis should not turn a safely stopped
+            # tool loop into a raw internal halt. Tools remain unavailable on
+            # both attempts, so this cannot reopen execution.
+            for attempt in range(2):
+                try:
+                    candidate = self._one_model_step()
+                except Exception:  # noqa: BLE001 — grace call is best-effort
+                    candidate = None
+                if ((candidate or {}).get("content") or "").strip():
+                    msg = candidate
+                    break
+                if attempt == 0:
+                    self.callbacks.on_thinking(
+                        "[wind-down response empty — retrying once without tools]"
+                    )
         finally:
             self._tools_filter_locked = prev_locked
             self._all_tools = prev_tools
@@ -922,7 +1382,45 @@ class JaegerAgent:
             return text
         return self._halt_turn()
 
+    def _slim_tools_to_core_for_overflow(self) -> bool:
+        """One-shot: shrink visible tools to CORE when schemas alone blow ctx.
+
+        Returns True when the catalog changed and the caller should retry the
+        turn. Locked / already-slimmed agents return False (fail closed to the
+        existing ContextOverflow raise path).
+
+        Scoping is OFF by default, so mutating ``_intent_tool_names`` alone
+        does not hide tools (``tools`` fails open via ``_tool_visibility``).
+        For this emergency retry we REPLACE ``_all_tools`` with the CORE
+        subset and lock the filter for the rest of the turn.
+        """
+        if getattr(self, "_overflow_tools_slimmed", False):
+            return False
+        if self._tools_filter_locked:
+            return False
+        try:
+            from jaeger_agent.skill_registry.toolset_scoping import CORE
+        except Exception:
+            return False
+        before = {getattr(t, "name", None) for t in (self.tools or [])}
+        before.discard(None)
+        if not before or before <= set(CORE):
+            return False
+        slimmed = [t for t in (self._all_tools or []) if getattr(t, "name", None) in CORE]
+        if not slimmed or len(slimmed) >= len(before):
+            return False
+        self._all_tools = slimmed
+        self._dispatch_by_name = {t.name: t for t in self._all_tools}
+        self._intent_tool_names = set(CORE)
+        self._tools_filter_locked = True
+        self._tools_filter_locked_reason = "overflow"
+        self._overflow_tools_slimmed = True
+        after = {getattr(t, "name", None) for t in (self.tools or [])}
+        after.discard(None)
+        return len(after) < len(before)
+
     def _refresh_tool_catalog(self) -> None:
+
         """Pick up tools registered AFTER this agent was built (skill
         installed / activated mid-session) so they become visible and
         dispatchable on the next turn. Honours the construction
@@ -938,11 +1436,11 @@ class JaegerAgent:
                 if self._toolset_resolver is None:
                     return
                 wanted = self._toolset_resolver(set(self.toolsets))
-                self._all_tools = _exclude_beta(
+                self._all_tools = _filter_available_tools(
                     [t for t in get_tools() if t.name in wanted]
                 )
             else:
-                self._all_tools = _exclude_beta(get_tools())
+                self._all_tools = _filter_available_tools(get_tools())
             self._dispatch_by_name = {t.name: t for t in self._all_tools}
         except Exception:  # noqa: BLE001 — a registry hiccup must not kill the turn
             pass
@@ -978,10 +1476,11 @@ class JaegerAgent:
     # spend ONE extra toolless call asking the model to wrap up. The
     # synthetic prompt is removed from history; the summary stays.
     _WIND_DOWN_PROMPT = (
-        "You have reached the tool-call budget for this turn. Stop "
+        "Tool execution has stopped for this turn. Stop "
         "using tools now. In one short reply: summarise what you "
         "accomplished, what remains undone, and the single next step "
-        "you would take."
+        "you would take. Preserve citations from gathered evidence and state "
+        "uncertainty. Do not claim missing tools, archives, or outputs succeeded."
     )
 
     def _one_model_step_with_length_retry(self) -> Message:
@@ -1076,7 +1575,7 @@ class JaegerAgent:
         self.last_activity_ts = time.time()
         self.last_activity_desc = desc
 
-    def _accumulate_usage(self, raw: Any) -> int:
+    def _accumulate_usage(self, raw: Any, adapter: Any = None) -> int:
         """Extract token usage from an adapter's raw response and add
         to the per-turn counters. Returns THIS call's prompt-token
         count (0 when unavailable) so the context guard can calibrate
@@ -1136,8 +1635,32 @@ class JaegerAgent:
                 self.last_prompt_tokens += per_call_prompt
             if c is not None:
                 self.last_completion_tokens += int(c)
+            self.turn_budget.observe_usage(
+                prompt_tokens=per_call_prompt,
+                completion_tokens=int(c) if c is not None else 0,
+            )
         except (TypeError, ValueError):
             return 0
+        # Persist exact provider totals when available. OpenAI-compatible
+        # Ollama reports cached prompt tokens as a subset of prompt_tokens,
+        # so retain them separately rather than adding them twice.
+        if adapter is not None:
+            try:
+                details = _get("prompt_tokens_details")
+                if isinstance(details, dict):
+                    cached = details.get("cached_tokens", 0)
+                else:
+                    cached = getattr(details, "cached_tokens", 0) if details else 0
+                self.callbacks.on_record_model_usage(
+                    str(getattr(adapter, "provider", "") or "unknown"),
+                    str(getattr(adapter, "model", "") or "unknown"),
+                    prompt_tokens=per_call_prompt,
+                    cached_prompt_tokens=int(cached or 0),
+                    completion_tokens=int(c or 0),
+                )
+            except Exception:  # noqa: BLE001 — telemetry is best-effort
+                pass
+
         return per_call_prompt
 
     # ── stale-call timeout (Phase-8) ───────────────────────────────
@@ -1155,6 +1678,7 @@ class JaegerAgent:
     # conservative: straight to fallback, as before.
     _RATE_LIMIT_RETRIES = 2
     _TRANSIENT_RETRIES = 1
+    _STALE_RETRIES = 1
 
     def _one_model_step(self) -> Message:
         """Format → call → parse, with classified retry + adapter
@@ -1246,12 +1770,21 @@ class JaegerAgent:
                             if self.callbacks.stream_delta is not None
                             else None
                         ),
+                        # Deliberation, streamed on its own channel as it
+                        # arrives. Without this a surface got the whole answer
+                        # before any of the thinking behind it — see
+                        # _streamed_reasoning below.
+                        on_reasoning=(
+                            self._emit_streamed_reasoning
+                            if self.callbacks.reasoning is not None
+                            else None
+                        ),
                     )
                     if self.last_ttft_s is None:
                         adapter_ttft = getattr(adapter, "last_ttft_s", None)
                         if adapter_ttft:
                             self.last_ttft_s = float(adapter_ttft)
-                    per_call_prompt = self._accumulate_usage(raw)
+                    per_call_prompt = self._accumulate_usage(raw, adapter)
                     if self.context_guard is not None and per_call_prompt:
                         try:
                             self.context_guard.observed_call(
@@ -1275,13 +1808,10 @@ class JaegerAgent:
                     self.last_halt_reason = "interrupted"
                     return {"role": "assistant", "content": None}
                 except StaleCallTimeout as exc:
-                    # Model stalled past the no-progress budget. For
-                    # in-process backends the abort flag has already
-                    # stopped the decode and reset the context (see
-                    # LocalLlamaAdapter.call); an HTTP fallback (if
-                    # configured) picks up next. If this was the last
-                    # adapter, the caller sees a clean ``stalled`` halt
-                    # reason rather than a generic exception.
+                    # Model stalled past the no-progress budget. Retry
+                    # the SAME adapter once (a 30s cloud think is often
+                    # a blip), then walk the fallback chain. If this
+                    # was the last adapter, the caller sees ``stalled``.
                     last_exc = exc
                     self.last_halt_reason = "stalled"
                     self.callbacks.on_thinking(
@@ -1290,7 +1820,14 @@ class JaegerAgent:
                         f"try ``jaeger kill`` from another terminal "
                         f"if the TUI feels stuck]"
                     )
-                    break  # next adapter — the stale window was burned
+                    if attempt < self._STALE_RETRIES and not self._interrupt_event.is_set():
+                        attempt += 1
+                        self.callbacks.on_thinking(
+                            f"[adapter {adapter.describe()} stalled — "
+                            f"retry {attempt}/{self._STALE_RETRIES}]"
+                        )
+                        continue
+                    break  # next adapter
                 except Exception as exc:  # noqa: BLE001 — adapter chain absorbs
                     last_exc = exc
                     if (
@@ -1359,6 +1896,11 @@ class JaegerAgent:
     _PATH_SCOPED_READ = frozenset({"read_file"})
     _PATH_SCOPED_WRITE = frozenset({
         "write_file", "append_file", "edit_file", "patch", "delete_file"})
+    _CACHEABLE_READ_TOOLS = frozenset({
+        "read_file", "list_skill_dir", "search_files",
+        "describe_tool", "list_tools", "list_skills",
+    })
+
     # These are logically read-only but share the process-wide SQLite
     # connection. ``check_same_thread=False`` permits a connection to move
     # between threads; it does not make simultaneous cursor use on that one
@@ -1428,6 +1970,7 @@ class JaegerAgent:
         via a duplicate marker, same as the sequential path.
         """
         from concurrent.futures import ThreadPoolExecutor
+        from contextvars import copy_context
 
         preps = [self._prepare_dispatch(tc) for tc in tool_calls]
         first_by_sig: dict[str, int] = {}
@@ -1443,7 +1986,7 @@ class JaegerAgent:
             thread_name_prefix="jaeger-tool",
         ) as pool:
             futures = {
-                i: pool.submit(self._execute_prepared, preps[i])
+                i: pool.submit(copy_context().run, self._execute_prepared, preps[i])
                 for i in unique_idx
             }
             for i, fut in futures.items():
@@ -1520,11 +2063,28 @@ class JaegerAgent:
         # counts.
         sig = call_signature(name, args)
         tool_def = dispatch_map.get(name)
+        # Overflow (and unlocked agents) can leave dispatch_map behind the
+        # live registry / describe_tool surface. Resolve once and cache.
+        # Explicit tools=[...] allowlists must stay closed.
+        if (
+            tool_def is None
+            and getattr(self, "_tools_filter_locked_reason", None) != "allowlist"
+        ):
+            try:
+                _cands = _filter_available_tools(
+                    [t for t in get_tools() if getattr(t, "name", None) == name]
+                )
+                if _cands:
+                    tool_def = _cands[0]
+                    self._dispatch_by_name[name] = tool_def
+            except Exception:  # noqa: BLE001 — miss stays unknown_tool
+                pass
         is_read_tool = (
             tool_def is not None
             and getattr(tool_def, "side_effect", "") == "read"
         )
         if not is_read_tool:
+            self._read_result_cache.clear()
             self._call_signature_counts[sig] = (
                 self._call_signature_counts.get(sig, 0) + 1
             )
@@ -1549,6 +2109,10 @@ class JaegerAgent:
         for read-only tools. Exceptions become error-result dicts."""
         name = prep["name"]
         args = prep["args"]
+        if name in self._CACHEABLE_READ_TOOLS and prep["sig"] in self._read_result_cache:
+            import copy
+            prep["cache_hit"] = True
+            return copy.deepcopy(self._read_result_cache[prep["sig"]])
         try:
             tool_def = prep["tool_def"]
             if tool_def is None:
@@ -1559,7 +2123,12 @@ class JaegerAgent:
                     "retryable": False,
                 }
             else:
-                content = tool_def.dispatch(args)
+                # A started tool must see THIS turn's interrupt, not only the loop between
+                # nodes: bind the turn's own event for the call so a cancel or Global Stop
+                # reaches a running command (tool_interrupt.is_interrupted reads it).
+                from jaeger_agent.core.cancellation import turn_cancellation
+                with turn_cancellation(self._interrupt_event):
+                    content = self._tool_executor.execute(tool_def, args)
         except Exception as exc:  # noqa: BLE001 — surfaced to the model
             # Tag safety/permission failures distinctly so the model
             # (and the latency log) can tell "retry with different
@@ -1584,6 +2153,13 @@ class JaegerAgent:
                         exc, "required_tier", None,
                     )
             except Exception:  # noqa: BLE001 — never break the loop over typing
+                pass
+            try:
+                from jaeger_agent.cognition.effects import EffectIndeterminate
+                if isinstance(exc, EffectIndeterminate):
+                    err_type = "effect_indeterminate"
+                    retryable = False
+            except Exception:  # noqa: BLE001
                 pass
             # Hardline guard refusals (run_shell catastrophic-command
             # blocklist) come back as a typed dict, not an exception;
@@ -1610,6 +2186,16 @@ class JaegerAgent:
         is_read_tool = prep["is_read"]
         guidance = prep["guidance"]
         started = prep["started"]
+        self._turn_tool_names.append(name)
+
+        # Determine outcome before truncation/hooks can replace a structured
+        # error with an artifact pointer. An error-only envelope is a failure.
+        _ok = not (isinstance(content, dict) and (
+            content.get("ok") is False or content.get("success") is False
+            or bool(content.get("error"))
+        ))
+        _err = str(content.get("error") or content.get("reason") or _stderr_tail(content)
+                   or "tool failed") if not _ok else None
 
         # Per-tool-result oversize guard. A single ``run_shell`` dump
         # or screenshot can dominate the next turn's context; cap it
@@ -1630,25 +2216,35 @@ class JaegerAgent:
             content = replacement
         if guidance:
             content = _merge_guidance(content, guidance)
+        if not _ok and isinstance(content, dict) and "recovery" not in content:
+            content = {**content, "recovery": _recovery_hint(name, args, _err)}
 
         elapsed = time.perf_counter() - started
         self.callbacks.on_tool_progress(
             name, "done", {"elapsed_s": round(elapsed, 3)},
         )
+        tool_def = prep.get("tool_def")
 
         # Passive observer for the tool_calls audit table. Determine
         # ok/error from the final content shape: dispatch-raised paths
         # built a ``{"ok": False, "error": ...}`` dict above; a tool
         # returning a successful payload won't carry ``"ok": False``.
-        _ok = True
-        _err: str | None = None
-        if isinstance(content, dict) and content.get("ok") is False:
+        if isinstance(content, dict) and (
+            content.get("ok") is False or content.get("success") is False or bool(content.get("error"))
+        ):
             _ok = False
             _err = str(content.get("error") or "") or None
+        if _ok and name in self._CACHEABLE_READ_TOOLS:
+            import copy
+            self._read_result_cache[sig] = copy.deepcopy(content)
         if _ok:
             # Verify-gate bookkeeping: the claim-vs-action check compares
             # the final answer's claims against what actually succeeded.
             self._turn_tool_successes.add(name)
+            if name == "use_skill" and isinstance(args, dict):
+                chosen = str(args.get("name") or "").strip()
+                if chosen:
+                    self._turn_skill_names.add(chosen)
         self.callbacks.on_tool_done(
             name, dict(args) if isinstance(args, dict) else {},
             content, _ok, _err, round(elapsed, 6),
@@ -1661,6 +2257,10 @@ class JaegerAgent:
         # the single point every dispatched tool passes through with its
         # outcome and duration already resolved, so count it here rather
         # than at each call site. Best-effort: telemetry never breaks a turn.
+        # Two sinks, each counted once: the agent-local usage registry
+        # (sidecar ``/usage``, skills curation) and the product-injected
+        # stats via the callbacks dependency inversion.
+        self.callbacks.on_record_tool(name, ok=_ok, elapsed=elapsed)
         try:
             from jaeger_agent.core.usage import record_tool
             record_tool(name, ok=_ok, elapsed=elapsed)
@@ -1715,12 +2315,27 @@ class JaegerAgent:
         if warning:
             content = _merge_guidance(content, warning)
 
-        self._append_message({
+        rendered_content = (
+            content if isinstance(content, str) else _stringify(content)
+        )
+        rendered_content = protect_tool_result(name, rendered_content)
+        tool_message = {
             "role": "tool",
             "tool_call_id": call_id,
             "name": name,
-            "content": content if isinstance(content, str) else _stringify(content),
-        })
+            "content": rendered_content,
+        }
+        self._append_message(tool_message)
+        if (
+            self._effect_checkpoint is not None
+            and tool_def is not None
+            and getattr(tool_def, "side_effect", "") != "read"
+        ):
+            self._effect_checkpoint(
+                name,
+                dict(args) if isinstance(args, dict) else {},
+                dict(tool_message),
+            )
 
     def _finalize_skip_final(
         self,
@@ -1773,6 +2388,15 @@ def _exclude_beta(tools: list[ToolDef]) -> list[ToolDef]:
     return [t for t in tools if not t.beta]
 
 
+def _filter_available_tools(tools: list[ToolDef]) -> list[ToolDef]:
+    """Apply beta and runtime-readiness gates to the model and dispatch surface.
+
+    Availability is evaluated per catalog refresh, not cached process-wide, so
+    credentials and session-installed scopes can change between turns.
+    """
+    return [tool for tool in _exclude_beta(tools) if tool.is_available()]
+
+
 _MULTISTEP_PATTERNS = (
     " and then ", " then ", " after that", " next, ",
     " followed by ", " ; ",
@@ -1822,6 +2446,52 @@ def _stringify(content: Any) -> str:
         return json.dumps(content, default=str, ensure_ascii=False)
     except Exception:  # noqa: BLE001 — last-resort fallback
         return str(content)
+
+
+_PATH_ERROR = _re.compile(
+    r"(?i)(no such file|not found|does not exist|outside (the )?(allowed|writable)|"
+    r"not a directory|is a directory|permission denied|escapes|not allowed)")
+
+
+def _recovery_hint(name: str, args: Any, error: str | None) -> str:
+    """What to do after a failed call: reflect, change something, retry.
+
+    Small local models tend to repeat the identical failing call or quietly
+    give up. One structured line on every failed result asks for the cause,
+    a concrete change, and an honest report if it cannot work.
+    """
+    hint = ("This call failed. Read the error, state the cause in one line, then change "
+            "something before retrying (arguments, path, or a different tool). Do not repeat "
+            "the identical call. If it cannot work, say so plainly instead of guessing.")
+    has_path = isinstance(args, dict) and any(k in args for k in ("path", "file", "src", "dst", "cwd", "workdir"))
+    if has_path and _PATH_ERROR.search(str(error or "")):
+        try:
+            from jaeger_agent.core import workspace as _ws
+            roots = ", ".join(str(r) for r in _ws.writable_roots())
+            base = _ws.get_project_root() or _ws._require_layout().root
+            hint += (f" Relative paths resolve from {base}; absolute paths must be inside "
+                     f"{roots}. Check what exists (search_files, or ls in terminal) first.")
+        except Exception:  # noqa: BLE001 — the generic hint still stands
+            hint += " Check what exists (search_files, or ls in terminal) before retrying."
+    elif name == "execute_code" and _PATH_ERROR.search(str(error or "")):
+        try:
+            from jaeger_agent.core import workspace as _ws
+            sandbox = _ws.get_project_root() or _ws._require_layout().skills_dir
+            base = _ws.get_project_root() or _ws._require_layout().root
+            where = f" It runs sandboxed in {sandbox} and can only open files there."
+            shell = f" or the terminal tool (starts in {base}, so `workspace/...` resolves)"
+        except Exception:  # noqa: BLE001 — the generic hint still stands
+            where, shell = " It runs sandboxed and can only open files in its own directory.", " or the terminal tool"
+        hint += (f" execute_code cannot see workspace files.{where} Read inputs with read_file and "
+                 f"write outputs with write_file (paths like `workspace/...`){shell}.")
+    return hint
+
+
+def _stderr_tail(content: dict) -> str:
+    """Last non-empty stderr line of a failed code/shell result, so the
+    recorded error and recovery hint name the real cause."""
+    lines = [ln.strip() for ln in str(content.get("stderr") or "").splitlines() if ln.strip()]
+    return lines[-1][:300] if lines else ""
 
 
 def _merge_guidance(content: Any, guidance: str) -> Any:

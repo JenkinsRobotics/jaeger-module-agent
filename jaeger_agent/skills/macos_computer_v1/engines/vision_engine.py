@@ -10,7 +10,7 @@ Most common real-world cases: canvas / WebGL apps, games, image
 viewers, design tools (Figma, Photoshop) whose UI sits inside a
 single big AX object, or any app that just doesn't ship AX support.
 
-Delegates to the universal :mod:`jaeger_os.agent.skills.computer_use`
+Delegates to the universal :mod:`jaeger_agent.skills.computer_use`
 skill's primitives (screenshot, click_xy, type_text). That keeps
 the screenshot loop in ONE place — improvements to it (better
 OCR, vision-LM grounding, etc.) benefit both this engine and any
@@ -101,7 +101,7 @@ class VisionEngine:
                 result = _v1.computer_press_key(key=str(args.get("key", "")))
             elif kind == "screenshot":
                 result = _v1.computer_screenshot(
-                    path=str(args.get("path", "")),
+                    path=str(args.get("path") or "screen.png"),
                 )
             elif kind in ("read_screen", "read"):
                 result = _v1.computer_read_screen()

@@ -47,7 +47,7 @@ from .context_blocks import (
     load_v2_self_improvement,
 )
 
-PromptMode = Literal["agent", "subagent", "deep_think", "idle_board", "cron"]
+PromptMode = Literal["agent", "subagent", "deep_think", "idle_board", "cron", "lean"]
 
 
 # Subagent-specific opener. Same rules/identity scaffold the parent uses, so
@@ -65,8 +65,16 @@ def _all(_mode: PromptMode) -> bool:
     return True
 
 
+def _non_lean(mode: PromptMode) -> bool:
+    return mode != "lean"
+
+
 def _non_subagent(mode: PromptMode) -> bool:
     return mode != "subagent"
+
+
+def _non_subagent_or_lean(mode: PromptMode) -> bool:
+    return mode not in ("subagent", "lean")
 
 
 def _agent_only(mode: PromptMode) -> bool:
@@ -116,8 +124,7 @@ def _three_laws(_ctx: FragmentContext) -> str:
 # NOTE: there is deliberately NO character/persona fragment here. The persona is
 # applied by the two-pass OUTPUT FILTER (re-voicing the final reply), not injected
 # into the worker prompt — a 4B's execution degrades ~7% with a character in
-# context (measured in JaegerAI, dev/docs/reality/persona_compiler.md).
-# Workers run vanilla; the
+# context (measured: dev/docs/reality/persona_compiler.md). Workers run vanilla; the
 # character's compiled View (Character.character_block()) feeds the filter, which
 # lives in the response path, not prompt assembly.
 #
@@ -135,13 +142,13 @@ def _identity_name(ctx: FragmentContext) -> str:
 
     The active character NEVER supplies the name: a character is a persona
     (voice + mannerisms, applied by the output filter), while identity.yaml
-    is the unique robot the operator named at instance creation — "I might
-    want a robot like Jarvis but I will name him Ted; the character prompt
-    gives the personality but the unique instance info isn't overwritten"
-    (operator, 2026-07-05). The character prompt must never overwrite it.
+    is the unique assistant the operator named at instance creation. A
+    character can inspire its personality, but must never overwrite the
+    configured assistant identity. The character prompt must never overwrite
+    it.
 
     Name ONLY: soul/traits/voice stay out of the worker prompt (station 3,
-    docs/skills/agentic_runners.md — the measured ~7-point execution tax); the
+    dev/docs/reality/agentic_runners.md — the measured ~7-point execution tax); the
     persona output filter supplies the voice.
 
     ``JAEGER_BENCH_NEUTRAL_IDENTITY`` is now a NO-OP kept for bench-runner
@@ -157,12 +164,47 @@ def _identity_name(ctx: FragmentContext) -> str:
     return f"Your name is {name}." if name else ""
 
 
+def _entity_self_state(_ctx: FragmentContext) -> str:
+    """Truthful live self-state from the canonical EntityRuntime."""
+    try:
+        from jaeger_ai.core.entity.runtime import EntityRuntime
+        runtime = EntityRuntime.get_singleton()
+        if runtime and runtime.current_state:
+            return runtime.current_state.to_prompt_context_block()
+    except Exception:
+        pass
+    return ""
+
+
+def _retrieved_reflections(ctx: FragmentContext) -> str:
+    """Relevant failure warnings & hypotheses from ReflexionStore."""
+    try:
+        from jaeger_ai.core.entity.runtime import EntityRuntime
+        runtime = EntityRuntime.get_singleton()
+        if runtime and hasattr(runtime, "reflexion_store") and runtime.reflexion_store:
+            query = ctx.goal or ctx.context or ""
+            return runtime.reflexion_store.to_prompt_context_block(query)
+    except Exception:
+        pass
+    return ""
+
+
 # ── the registry: order here IS the prompt order ──────────────────────
 PROMPT_FRAGMENTS: list[PromptFragment] = [
     PromptFragment(
         "three_laws", "safety", "agent/prompts/three_laws.md",
         _three_laws, _all,
         "inviolable safety contract — first thing the model sees, every mode",
+    ),
+    PromptFragment(
+        "entity_self_state", "dynamic", "(generated: EntityRuntime.current_state)",
+        _entity_self_state, _non_subagent_or_lean,
+        "authoritative entity self-state projection — live facts and active goals",
+    ),
+    PromptFragment(
+        "retrieved_reflections", "dynamic", "(generated: ReflexionStore)",
+        _retrieved_reflections, _non_lean,
+        "retrieved failure warnings and reflection hypotheses from prior experience",
     ),
     PromptFragment(
         "subagent_preamble", "framework", "(generated)",
@@ -185,13 +227,13 @@ PROMPT_FRAGMENTS: list[PromptFragment] = [
     ),
     PromptFragment(
         "framework", "framework", "agent/prompts/framework_agent.md",
-        lambda c: load_framework_prompt(), _all,
-        "standing framework instructions — every mode",
+        lambda c: load_framework_prompt(), _non_lean,
+        "standing framework instructions — every mode except lean",
     ),
     PromptFragment(
         "skill_index", "dynamic", "(generated: skill library)",
-        lambda c: build_skill_index_block(), _non_subagent,
-        "available playbooks — skipped for sub-agents",
+        lambda c: build_skill_index_block(), _non_subagent_or_lean,
+        "available playbooks — skipped for sub-agents and lean mode",
     ),
     PromptFragment(
         "v2_contract", "instance", "agent/prompts/agent_system_prompt.md",
@@ -200,17 +242,17 @@ PROMPT_FRAGMENTS: list[PromptFragment] = [
     ),
     PromptFragment(
         "runtime_tail", "dynamic", "(generated: toolset scoping)",
-        lambda c: build_runtime_tail(), _all,
-        "scoped vs. unscoped tool-surface note — every mode",
+        lambda c: build_runtime_tail(), _non_lean,
+        "scoped vs. unscoped tool-surface note — skipped in lean mode",
     ),
     PromptFragment(
         "board_digest", "dynamic", "(generated: kanban board)",
-        lambda c: build_board_block(c.layout), _non_subagent,
-        "actionable cards — skipped for sub-agents",
+        lambda c: build_board_block(c.layout), _non_subagent_or_lean,
+        "actionable cards — skipped for sub-agents and lean mode",
     ),
     PromptFragment(
         "tool_catalog", "dynamic", "(generated: toolset catalog)",
-        lambda c: build_toolset_catalog(), _all,
+        lambda c: build_toolset_catalog(), _non_lean,
         "loadable toolsets, under lean-surface scoping",
     ),
 ]
@@ -271,3 +313,13 @@ __all__ = [
     "PromptMode",
     "PROMPT_FRAGMENTS",
 ]
+
+
+def build_system_prompt(layout: "InstanceLayout") -> str:
+    """Assemble the live-agent system prompt — ``assemble_prompt(mode="agent")``.
+
+    Kept as a named entry because the live turn calls it on every request and
+    the explicit mode is easy to get wrong. New code can call
+    :func:`assemble_prompt` directly.
+    """
+    return assemble_prompt(layout, mode="agent")

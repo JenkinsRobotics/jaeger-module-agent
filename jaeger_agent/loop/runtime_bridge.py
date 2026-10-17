@@ -33,9 +33,38 @@ from typing import Any
 from jaeger_agent import AgentCallbacks, JaegerAgent
 from jaeger_agent.adapters.anthropic import AnthropicAdapter
 from jaeger_agent.adapters.base import ProviderAdapter
+from jaeger_agent.adapters.cli_backend import CliBackendAdapter
 from jaeger_agent.adapters.local_llama import LocalLlamaAdapter
 from jaeger_agent.adapters.openai import OpenAIAdapter
 from jaeger_agent.schemas.message_types import Message
+from jaeger_agent.loop.loop_backstop import MAX_TOOL_CALLS
+from jaeger_agent.loop.turn_budget import TurnBudgetLimits
+
+
+def _inject_usage_callbacks(cb: AgentCallbacks) -> AgentCallbacks:
+    """Inject usage statistics callbacks into AgentCallbacks for dependency inversion."""
+    try:
+        from jaeger_ai.core.runtime.usage_stats import (
+            record_model_usage,
+            record_skill,
+            record_skill_outcome,
+            record_skill_route,
+            record_tool,
+        )
+        if cb.record_skill_route is None:
+            cb.record_skill_route = record_skill_route
+        if cb.record_skill is None:
+            cb.record_skill = record_skill
+        if cb.record_skill_outcome is None:
+            cb.record_skill_outcome = record_skill_outcome
+        if cb.record_model_usage is None:
+            cb.record_model_usage = record_model_usage
+        if cb.record_tool is None:
+            cb.record_tool = record_tool
+    except ImportError:
+        pass
+    return cb
+
 
 
 def _resolve_local_max_tokens() -> int:
@@ -141,11 +170,18 @@ def _adapter_for_client(
         model = getattr(ext, "model", "")
         api_key = getattr(client, "_api_key", "") or ""
         timeout_s = float(getattr(ext, "timeout_s", 60.0) or 60.0)
+        max_tokens = int(getattr(ext, "max_tokens", 4096) or 4096)
+        if provider == "cli":
+            return CliBackendAdapter(
+                backend_id=model,
+                timeout_s=timeout_s,
+            )
         if provider == "anthropic":
             return AnthropicAdapter(
                 api_key=api_key,
                 model=model,
                 timeout_s=timeout_s,
+                max_tokens=max_tokens,
             )
         # Everything else (openai, gemini, ollama, ollama-cloud,
         # lmstudio) rides the OpenAI-compat surface.
@@ -156,6 +192,8 @@ def _adapter_for_client(
             base_url=getattr(ext, "base_url", None),
             num_ctx=getattr(client, "num_ctx", None),
             timeout_s=timeout_s,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort_for(provider, model, getattr(ext, "reasoning_effort", None)),
         )
 
     # Unknown client shape — caller should have caught this; raise here
@@ -164,6 +202,84 @@ def _adapter_for_client(
         f"runtime_bridge cannot select an adapter for client "
         f"{type(client).__name__}; expected ``.llm`` or ``.ext``."
     )
+
+
+_LOCAL_REASONING_PROVIDERS = frozenset({"ollama", "lmstudio"})
+
+
+def reasoning_effort_for(provider: str, model: str, configured: Any) -> str | None:
+    """The ``reasoning_effort`` to send, or None for the provider default.
+
+    ``auto`` (or unset) caps a local Ollama/LM Studio model at ``low``:
+    gemma-4-26b at ~8 tok/s spent 200-1,200 reasoning chunks per step in the
+    2026-10-09 capability run, and on a 300-token budget answered nothing at
+    the default but answered correctly at ``low`` (6.8 s) and ``none`` (3.5 s).
+    Cloud models keep their provider default.
+    """
+    value = str(configured or "auto").strip().lower()
+    if value == "provider":
+        return None
+    if value in {"none", "low", "medium", "high"}:
+        return value
+    model_l = str(model or "").lower()
+    if str(provider or "").lower() in _LOCAL_REASONING_PROVIDERS and not (
+        model_l.endswith(":cloud") or model_l.endswith("-cloud")
+    ):
+        return "low"
+    return None
+
+
+def _fallback_adapters_for(client: Any) -> list[ProviderAdapter]:
+    """Configured ``external_model.fallback`` → extra adapters.
+
+    Same API key / timeout as the primary client. Skips the serving
+    model so a stall actually walks to a *different* brain.
+    """
+    try:
+        from jaeger_ai.main import _pipeline
+        cfg = _pipeline.get("config")
+        rows = list(getattr(getattr(cfg, "external_model", None), "fallback", None) or [])
+    except Exception:  # noqa: BLE001 — missing config is "no fallback"
+        return []
+    if not rows:
+        return []
+    ext = getattr(client, "ext", None)
+    primary_model = str(getattr(ext, "model", "") or "")
+    primary_provider = str(getattr(ext, "provider", "") or "openai")
+    api_key = getattr(client, "_api_key", "") or ""
+    timeout_s = float(getattr(ext, "timeout_s", 60.0) or 60.0) if ext else 60.0
+    max_tokens = int(getattr(ext, "max_tokens", 4096) or 4096)
+    num_ctx = getattr(client, "num_ctx", None)
+    primary_base = getattr(ext, "base_url", None) if ext is not None else None
+    out: list[ProviderAdapter] = []
+    for row in rows:
+        if isinstance(row, dict):
+            provider = str(row.get("provider") or primary_provider)
+            model = str(row.get("model") or "")
+            base_url = row.get("base_url") or primary_base
+        else:
+            provider = str(getattr(row, "provider", None) or primary_provider)
+            model = str(getattr(row, "model", "") or "")
+            base_url = getattr(row, "base_url", None) or primary_base
+        if not model or model == primary_model:
+            continue
+        if provider == "cli":
+            out.append(CliBackendAdapter(
+                backend_id=model, timeout_s=timeout_s,
+            ))
+        elif provider == "anthropic":
+            out.append(AnthropicAdapter(
+                api_key=api_key, model=model, timeout_s=timeout_s,
+                max_tokens=max_tokens,
+            ))
+        else:
+            out.append(OpenAIAdapter(
+                provider=provider, model=model, api_key=api_key,
+                base_url=base_url or None, num_ctx=num_ctx,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+            ))
+    return out
 
 
 def _make_fast_finalize_finalizer(client: Any) -> Any:
@@ -200,25 +316,30 @@ def build_jaeger_agent(
     client: Any,
     *,
     system_prompt: str = "",
+    tools: list | None = None,
     tools_enabled: bool = True,
     toolsets: set[str] | frozenset[str] | list[str] | None = None,
     skip_final_tools: set[str] | frozenset[str] | None = None,
     callbacks: AgentCallbacks | None = None,
     max_iterations: int = 24,
+    max_tool_calls: int | None = None,
     ctx_window: int | None = None,
     completion_reserve: int | None = None,
     artifact_dir: Any = None,
     stale_call_timeout_s: float | None = None,
     context_summarizer: Any = None,
+    turn_max_elapsed_s: float | None = None,
+    turn_max_tokens: int | None = None,
+    turn_max_tool_cost: float | None = None,
     scope_tools: bool = False,
 ) -> JaegerAgent:
     """Construct a :class:`JaegerAgent` wired against the provided
     JROS client. The skip-final finalizer is the legacy bounded-chat
     paraphraser so phrasing stays identical to the pre-refactor path.
 
-    ``max_iterations=24`` matches the legacy ``_MAX_TOOL_CALLS`` ceiling
-    so the loop backstop trips at the same point and the benchmark
-    measures the same boundary.
+    ``max_tool_calls`` defaults to ``max_iterations`` for compatibility.
+    Hosts may raise both for autonomous work without changing the global
+    safety defaults used by embedded callers.
 
     ``toolsets`` (Phase 7): when provided, the agent's tool catalogue
     is filtered to just those Hermes-style groups. When ``None``
@@ -307,11 +428,10 @@ def build_jaeger_agent(
         # call — callers wire it ONLY for latency-free contexts
         # (deep think), never the voice path.
         guard = ContextGuard(budget, summarizer=context_summarizer)
-    # Default stall timeout depends on the backend. HTTP adapters do
-    # well with 30s (the SDK is usually streaming or about to error
-    # out). In-process llama.cpp on Metal can sit in a long prefill
-    # for 60-90s on a cold load of a big model, so the default for
-    # the local backend is more generous. The caller can override.
+    # A reasoning model may legitimately spend well over 30 seconds before
+    # emitting its first streamed token. Use the same generous floor for HTTP
+    # and local adapters; network connect/read timeouts still catch dead peers.
+    # The caller can override this for latency-sensitive surfaces.
     if stale_call_timeout_s is None:
         if adapter.__class__.__name__ in ("LocalLlamaAdapter", "MLXAdapter"):
             # Cold prefill on a 30B Q4 can take ~60s; allow headroom
@@ -321,20 +441,30 @@ def build_jaeger_agent(
             # catches it cleanly while letting normal work finish.
             stale_call_timeout_s = 120.0
         else:
-            stale_call_timeout_s = 30.0
+            stale_call_timeout_s = 120.0
     agent = JaegerAgent(
         adapter=adapter,
+        fallback_adapters=_fallback_adapters_for(client),
         system_prompt=system_prompt,
-        tools=None if tools_enabled else [],
-        toolsets=toolsets,
+        tools=tools if tools is not None else (None if tools_enabled else []),
+        toolsets=toolsets if tools is None else None,
         skip_final_tools=frozenset(skip_final_tools or ()),
         skip_final_finalizer=_make_fast_finalize_finalizer(client),
-        callbacks=callbacks or AgentCallbacks(),
+        callbacks=_inject_usage_callbacks(callbacks or AgentCallbacks()),
+
         max_iterations=max_iterations,
+
         context_guard=guard,
         toolset_resolver=resolve_toolsets,
         tool_visibility=scoped_tool_visible if scope_tools else tool_visible,
         turn_start_hook=_reset_turn_state,
+        turn_budget_limits=TurnBudgetLimits(
+            max_tool_calls=max(1, int(max_tool_calls or max_iterations)),
+            max_iterations=max_iterations,
+            max_elapsed_s=turn_max_elapsed_s,
+            max_tokens=turn_max_tokens,
+            max_tool_cost=turn_max_tool_cost,
+        ),
     )
     agent.stale_call_timeout_s = stale_call_timeout_s
     return agent
@@ -377,6 +507,29 @@ def _first_decision_from(messages: list[Message]) -> dict[str, Any] | None:
     return None
 
 
+def _run_turn_with_executive(agent: JaegerAgent, user_text: str, *, content: Any = None) -> str:
+    """Persist the run when state.db is bound; otherwise just the loop."""
+    from jaeger_agent.memory import sqlite_store
+
+    options = {"content": content} if content is not None else {}
+    if not sqlite_store.is_bound():
+        return agent.run_turn(user_text, **options)
+    from jaeger_agent.cognition.executive import TurnExecutive
+    from jaeger_agent.cognition.sqlite_commitments import SqliteCommitmentStore
+    from jaeger_agent.cognition.sqlite_runs import SqliteRunStore
+    from jaeger_agent.memory.sqlite_knowledge import SqliteKnowledgeStore
+
+    return TurnExecutive(
+        agent,
+        SqliteRunStore(),
+        SqliteCommitmentStore(),
+        provider=getattr(agent.primary_adapter, "name", None),
+        claims=SqliteKnowledgeStore(),
+        world_event=getattr(agent, "_world_event", None),
+        prepare_world_context=False,  # host turn preparation already added it
+    ).run_turn(user_text, **options)
+
+
 def drive_one_turn(
     agent: JaegerAgent,
     user_text: str,
@@ -402,11 +555,53 @@ def drive_one_turn(
 
     started = time.perf_counter()
     try:
-        answer = agent.run_turn(user_text, content=content)
+        answer = _run_turn_with_executive(agent, user_text, content=content)
     except ContextOverflow as overflow:
-        # Pre-flight refusal — the prompt couldn't be trimmed enough to
-        # fit. Surface an actionable message and end the turn cleanly
-        # so the TUI doesn't see a backtrace.
+        # Pre-flight refusal — often tool schemas alone exceed a small
+        # local model's usable prompt room. Slim to CORE once and retry
+        # before surfacing the actionable refuse message.
+        if (
+            overflow.tools_tokens >= max(1, overflow.budget)
+            and hasattr(agent, "_slim_tools_to_core_for_overflow")
+            and agent._slim_tools_to_core_for_overflow()
+        ):
+            try:
+                answer = _run_turn_with_executive(agent, user_text, content=content)
+            except ContextOverflow as overflow:
+                elapsed = time.perf_counter() - started
+                return {
+                    "answer": friendly_overflow_text(
+                        estimated=overflow.estimated,
+                        budget=overflow.budget,
+                        system_prompt_tokens=overflow.system_prompt_tokens,
+                        tools_tokens=overflow.tools_tokens,
+                        latest_user_tokens=overflow.latest_user_tokens,
+                    ),
+                    "tool_activity": [],
+                    "first_decision": None,
+                    "elapsed_s": elapsed,
+                    "skipped": False,
+                    "halt_reason": "context_overflow",
+                    "iterations": 0,
+                    "new_messages": [],
+                }
+            else:
+                # Fall through to the normal success packaging below.
+                elapsed = time.perf_counter() - started
+                new_messages = agent.last_turn_messages
+                return {
+                    "answer": answer,
+                    "tool_activity": _tool_activity_lines(new_messages),
+                    "first_decision": _first_decision_from(new_messages),
+                    "elapsed_s": elapsed,
+                    "skipped": agent.last_skip_final,
+                    "halt_reason": agent.last_halt_reason,
+                    "iterations": agent.last_iteration_count,
+                    "new_messages": new_messages,
+                    "prompt_tokens": agent.last_prompt_tokens,
+                    "completion_tokens": agent.last_completion_tokens,
+                    "ttft_s": agent.last_ttft_s,
+                }
         elapsed = time.perf_counter() - started
         return {
             "answer": friendly_overflow_text(
@@ -450,6 +645,7 @@ def drive_one_turn(
         # Real time-to-first-token of the turn's first model call —
         # None when no adapter reported one (test stubs, plain create).
         "ttft_s": agent.last_ttft_s,
+        "turn_budget": agent.turn_budget.snapshot(),
     }
 
 

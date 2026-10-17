@@ -23,19 +23,64 @@ trivially unit-testable.
 from __future__ import annotations
 
 from typing import Any
+import re
 
 # Observed legitimate multi-step work tops out near ~16 tool calls and
 # varies its arguments. These limits are a safety net, not a fine-grained
 # iteration tuner — bump them if real workloads need it, but don't lower.
 MAX_TOOL_CALLS = 24
+WARN_TOOL_CALLS = 20
 MAX_IDENTICAL_CALLS = 4
-MAX_SEMANTIC_FAILURES = 2
+MAX_SEMANTIC_FAILURES = 2  # 2-strike: same failure signature twice → halt
+
+# Mail.app tools whose mailbox-name retries must collapse to one
+# signature. Variant `Trash` / `[Gmail]/Trash` / `Deleted Messages`
+# errors are the same resolve failure, not a new attempt.
+MAIL_TOOLS = frozenset({
+    "list_mail", "list_mailboxes", "read_mail", "plan_mail_triage",
+    "move_mail", "batch_move", "sweep_mail",
+})
 
 # Warn-before-halt thresholds (Hermes ``tool_guardrails`` pattern).
 # A warning never blocks execution — it rides on the tool result so the
 # model sees the pattern while it can still change course.
 WARN_IDENTICAL_CALLS = 2      # halt at 4 — warn from the 2nd repeat
 WARN_SEMANTIC_FAILURES = 1    # halt at 2 — warn on the 1st repeat
+
+
+def collapse_generated_repetition(text: str) -> tuple[str, int]:
+    """Collapse a high-confidence repeated response block.
+
+    Some providers occasionally emit the same paragraph sequence until the
+    output limit.  Only exact, consecutive repetition of a meaningful block
+    (at least 80 characters) three or more times is changed. Ordinary repeated
+    headings, short acknowledgements, and non-consecutive references remain
+    untouched.
+    """
+    raw = str(text or "")
+    if len(raw) < 240:
+        return raw, 1
+    blocks = [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()]
+    if len(blocks) < 3:
+        # Providers that lose paragraph separators often repeat whole lines.
+        blocks = [part.strip() for part in raw.splitlines() if part.strip()]
+    count = len(blocks)
+    for unit_size in range(1, count // 3 + 1):
+        if count % unit_size:
+            continue
+        repeats = count // unit_size
+        if repeats < 3:
+            continue
+        unit = blocks[:unit_size]
+        if len("\n\n".join(unit)) < 80:
+            continue
+        if all(blocks[index:index + unit_size] == unit for index in range(0, count, unit_size)):
+            collapsed = "\n\n".join(unit)
+            return (
+                f"{collapsed}\n\n[repetition guard: collapsed {repeats} identical generated blocks]",
+                repeats,
+            )
+    return raw, 1
 
 
 def call_signature(tool_name: str, args: Any) -> str:
@@ -55,7 +100,12 @@ def semantic_failure_signature(
     irrelevant args while hitting the same underlying error. This
     normalizes the action to ``tool | target | first error line``.
     """
-    if not isinstance(content, dict) or content.get("ok") is True:
+    if not isinstance(content, dict):
+        return None
+    # ``success: False`` is a failure even when ``ok`` is True — Mail.app
+    # tools (and anything else using the structured envelope) share that
+    # bit with the evaluation gate.
+    if content.get("ok") is True and content.get("success") is not False:
         return None
     error = (
         content.get("stderr")
@@ -64,16 +114,31 @@ def semantic_failure_signature(
         or content.get("reason")
         or ""
     )
+    timed_out = bool(content.get("timed_out")) or (
+        "timed out" in str(error).lower() or "timeout" in str(error).lower()
+    )
+    if timed_out:
+        # Variant AppleScript / shell payloads all hang the same way.
+        # Hashing the code body let the 60-tool mail loop dodge this
+        # backstop — every timeout is the same failure class.
+        return f"{tool_name}|timeout|timed out"
     if not error:
         return None
     first_line = str(error).strip().splitlines()[0][:160]
+    if tool_name in MAIL_TOOLS:
+        account = str(args.get("account") or "") if isinstance(args, dict) else ""
+        err_l = first_line.lower()
+        if any(s in err_l for s in ("mailbox", "can't get", "can’t get", "not found")):
+            return f"{tool_name}|{account}|mailbox-resolve"
+        return f"{tool_name}|{account}|{first_line}"
     if isinstance(args, dict):
         target = (
             args.get("path") or args.get("file") or args.get("name")
+            or args.get("account")
             or content.get("path") or content.get("file") or ""
         )
-        if not target and tool_name in ("execute_code", "run_python"):
-            code = str(args.get("code") or "")
+        if not target and tool_name in ("execute_code", "run_python", "run_shell", "terminal"):
+            code = str(args.get("code") or args.get("command") or "")
             target = f"code:{hash(code) & 0xffff:x}" if code else ""
     else:
         target = ""
@@ -125,6 +190,8 @@ def loop_halt_reason(
     tool_calls_made: int,
     call_signatures: dict[str, int],
     failure_signatures: dict[str, int] | None = None,
+    *,
+    max_tool_calls: int = MAX_TOOL_CALLS,
 ) -> str | None:
     """Return a halt reason when the turn is spinning, else ``None``.
 
@@ -144,19 +211,50 @@ def loop_halt_reason(
                 f"called {sig.split('|', 1)[0]} with identical "
                 f"arguments {n} times"
             )
-    if tool_calls_made > MAX_TOOL_CALLS:
+    if tool_calls_made >= max_tool_calls:
         return f"made {tool_calls_made} tool calls in a single turn"
+    return None
+
+
+def tool_budget_warning(
+    tool_calls_made: int,
+    *,
+    max_tool_calls: int = MAX_TOOL_CALLS,
+    warning_fraction: float = WARN_TOOL_CALLS / MAX_TOOL_CALLS,
+) -> str | None:
+    """Tell the model to synthesize before the total-call fuse fires.
+
+    Repetition warnings are signature-specific and live in
+    :func:`loop_warning`.  The total budget is different: varied calls may
+    all be legitimate, but the model still needs advance notice that it must
+    stop investigating and turn the accumulated results into an answer.
+    """
+    warn_at = max(1, int(max_tool_calls * min(0.99, max(0.01, warning_fraction))))
+    if warn_at <= tool_calls_made < max_tool_calls:
+        remaining = max_tool_calls - tool_calls_made
+        return (
+            f"[tool budget: {remaining} call(s) remain this turn. "
+            "Prioritize the next concrete implementation or verification step. "
+            "If the limit is reached, checkpoint the same task accurately; do "
+            "not redefine a repair as a report or claim completion. If the remaining "
+            "work repeats one operation over many items, use execute_with_tools "
+            "for the batch; otherwise call another tool only if essential.]"
+        )
     return None
 
 
 __all__ = [
     "MAX_TOOL_CALLS",
+    "WARN_TOOL_CALLS",
     "MAX_IDENTICAL_CALLS",
     "MAX_SEMANTIC_FAILURES",
+    "MAIL_TOOLS",
     "WARN_IDENTICAL_CALLS",
     "WARN_SEMANTIC_FAILURES",
     "call_signature",
     "semantic_failure_signature",
+    "collapse_generated_repetition",
+    "tool_budget_warning",
     "loop_halt_reason",
     "loop_warning",
 ]

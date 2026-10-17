@@ -20,6 +20,7 @@ instance dir, giving the human a real authorship audit trail.
 
 from __future__ import annotations
 
+import re
 import os
 import shutil
 from pathlib import Path
@@ -32,6 +33,7 @@ from jaeger_agent.core.workspace import (
     _display_path,
     _require_layout,
     _resolve_read,
+    _resolve_under,
     _resolve_write,
     git_autocommit,
 )
@@ -52,7 +54,7 @@ _SEARCH_SKIP = frozenset({
 # limit) read; once the same unchanged read has been served twice it returns a
 # stub instead. ``main._run_via_iter`` calls reset_read_tracker() once per turn
 # so dedup only ever fires within a single turn, never across turns.
-_READ_TRACKER: dict[tuple[str, int, int | None], dict[str, Any]] = {}
+_READ_TRACKER: dict[tuple[str, int, int | None, int], dict[str, Any]] = {}
 _DEDUP_AFTER_READS = 2   # serve content for the first 2 reads; stub the 3rd+
 _READ_TRACKER_CAP = 512  # bound the tracker against a pathological turn
 
@@ -63,7 +65,7 @@ def reset_read_tracker() -> None:
 
 
 def _remember_read(
-    key: tuple[str, int, int | None], mtime: float, total_lines: int
+    key: tuple[str, int, int | None, int], mtime: float, total_lines: int
 ) -> None:
     """Record that ``key`` was served fresh content at ``mtime``."""
     prev = _READ_TRACKER.get(key)
@@ -108,7 +110,8 @@ def file_write(path: str, content: str) -> dict[str, Any]:
       - everything else → ``<instance>/skills/`` — code modules
         (``SKILL.md`` + ``.py``). Backward-compatible default.
 
-    Refuses absolute paths, ``..`` escapes, symlinks that escape the
+    Absolute paths are accepted only inside the writable roots (project,
+    workspace, skills). Refuses ``..`` escapes, symlinks that escape the
     sandbox, and any attempt to touch identity.yaml / config.yaml /
     manifest.json / credentials / memory / logs. Every write is
     recorded in ``logs/audit.log`` AND auto-committed to the instance's
@@ -178,6 +181,55 @@ def append_file(path: str, content: str) -> dict[str, Any]:
     return result
 
 
+def _leading_ws(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _line_windows(original: str, old: str) -> tuple[list[str], list[str]]:
+    return original.split("\n"), old.strip("\n").split("\n")
+
+
+def _tolerant_hits(original: str, old: str) -> list[int]:
+    """Start lines where ``old`` matches ignoring leading/trailing whitespace on each line."""
+    o_lines, n_lines = _line_windows(original, old)
+    if not any(line.strip() for line in n_lines):
+        return []
+    want = [line.strip() for line in n_lines]
+    span = len(n_lines)
+    return [
+        i for i in range(len(o_lines) - span + 1)
+        if [line.strip() for line in o_lines[i:i + span]] == want
+    ]
+
+
+def _reindent(new: str, old_indent: str, file_indent: str) -> str:
+    """Give ``new`` the file's indentation where the model's snippet used another one."""
+    out = []
+    for line in new.strip("\n").split("\n"):
+        out.append(file_indent + line[len(old_indent):] if old_indent and line.startswith(old_indent)
+                   else (file_indent + line if not old_indent and line.strip() else line))
+    return "\n".join(out)
+
+
+def _closest_region(original: str, old: str) -> str:
+    """The lines of ``original`` most like ``old``, for a retry hint ('' if nothing is close)."""
+    import difflib
+
+    o_lines, n_lines = _line_windows(original, old)
+    span = max(1, len(n_lines))
+    want = "\n".join(line.strip() for line in n_lines)
+    best, best_at = 0.0, -1
+    for i in range(max(1, len(o_lines) - span + 1)):
+        got = "\n".join(line.strip() for line in o_lines[i:i + span])
+        ratio = difflib.SequenceMatcher(None, want, got).ratio()
+        if ratio > best:
+            best, best_at = ratio, i
+    if best < 0.5 or best_at < 0:
+        return ""
+    region = "\n".join(o_lines[best_at:best_at + min(span, 8)])
+    return f"closest match at lines {best_at + 1}-{best_at + span}:\n{region}"
+
+
 def edit_file(path: str, old: str, new: str, replace_all: bool = False) -> dict[str, Any]:
     """Make a surgical find-and-replace edit to a file under skills/.
 
@@ -204,17 +256,38 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False) -> dict[
 
     original = target.read_text(encoding="utf-8")
     count = original.count(old)
+    matched = "exact"
     if count == 0:
-        return {"edited": False, "error": "old text not found in file", "path": path}
-    if count > 1 and not replace_all:
+        # Models often re-type a snippet with different indentation or trailing
+        # spaces. Accept that when it identifies exactly one place.
+        hits = _tolerant_hits(original, old)
+        if len(hits) == 1 and not replace_all:
+            o_lines, n_lines = _line_windows(original, old)
+            first_new = next((ln for ln in n_lines if ln.strip()), "")
+            first_file = next((ln for ln in o_lines[hits[0]:hits[0] + len(n_lines)] if ln.strip()), "")
+            replacement = _reindent(new, _leading_ws(first_new), _leading_ws(first_file))
+            o_lines[hits[0]:hits[0] + len(n_lines)] = replacement.split("\n")
+            updated, count, matched = "\n".join(o_lines), 1, "whitespace-tolerant"
+        elif len(hits) > 1:
+            return {"edited": False, "path": path, "error": (
+                f"old text matches {len(hits)} places ignoring whitespace (lines "
+                f"{', '.join(str(h + 1) for h in hits[:6])}). Include more surrounding lines to make it unique.")}
+        else:
+            hint = _closest_region(original, old)
+            return {"edited": False, "path": path,
+                    "error": "old text not found in file" + (f"; {hint}" if hint else
+                             ". Re-read the file (read_file) and copy the exact lines.")}
+    elif count > 1 and not replace_all:
+        lines = [original.count("\n", 0, m.start()) + 1 for m in re.finditer(re.escape(old), original)]
         return {
             "edited": False,
-            "error": (f"old text appears {count}× — not unique. Pass a longer "
-                      "unique snippet, or replace_all=true."),
+            "error": (f"old text appears {count}× (lines {', '.join(map(str, lines[:8]))}) — not unique. "
+                      "Pass a longer unique snippet, or replace_all=true."),
             "path": path,
         }
 
-    updated = original.replace(old, new)
+    if matched == "exact":
+        updated = original.replace(old, new)
     target.write_text(updated, encoding="utf-8")
     rel = _display_path(target, layout)
     replacements = count if replace_all else 1
@@ -225,6 +298,8 @@ def edit_file(path: str, old: str, new: str, replace_all: bool = False) -> dict[
         "edited": True, "path": rel, "replacements": replacements,
         "bytes": len(updated.encode("utf-8")),
     }
+    if matched != "exact":
+        result["matched"] = matched
     if commit_sha:
         result["commit"] = commit_sha
     syntax = _maybe_syntax_check(rel, updated)
@@ -341,7 +416,7 @@ def copy_file(src: str, dst: str) -> dict[str, Any]:
     return result
 
 
-def file_read(path: str, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+def file_read(path: str, offset: int = 0, limit: int | None = None, column: int = 0) -> dict[str, Any]:
     """Read a text file from ANYWHERE — Jaeger's own source code, the
     repository it lives in, the wider system.
 
@@ -350,7 +425,9 @@ def file_read(path: str, offset: int = 0, limit: int | None = None) -> dict[str,
     file (a hint points at ``get_credential()``).
 
     For a large file, page it: ``offset`` is the 0-based first line and
-    ``limit`` the number of lines to return (default: the whole file).
+    ``limit`` the number of lines to return (default: 200). Results are
+    capped at 12,000 characters; resume with ``next_offset`` and
+    ``next_column`` (as ``offset`` and ``column``), including long JSON lines.
     The result then also carries ``total_lines`` so you know how much
     is left.
 
@@ -372,7 +449,8 @@ def file_read(path: str, offset: int = 0, limit: int | None = None) -> dict[str,
 
     rel = _display_path(target, layout)
     off = max(0, int(offset or 0))
-    key = (str(target), off, limit)
+    col = max(0, int(column or 0))
+    key = (str(target), off, limit, col)
     try:
         mtime: float | None = target.stat().st_mtime
     except OSError:
@@ -404,19 +482,30 @@ def file_read(path: str, offset: int = 0, limit: int | None = None) -> dict[str,
                 "path": path}
 
     lines = full.splitlines(keepends=True)
-    if off or limit is not None:
-        end = len(lines) if limit is None else off + max(0, int(limit))
-        content = "".join(lines[off:end])
-        result: dict[str, Any] = {
-            "read": True, "path": rel, "content": content,
-            "bytes": len(content.encode("utf-8")),
-            "offset": off, "total_lines": len(lines),
-        }
-    else:
-        result = {
-            "read": True, "path": rel, "content": full,
-            "bytes": len(full.encode("utf-8")),
-        }
+    end = min(len(lines), off + (200 if limit is None else max(0, int(limit))))
+    chunks: list[str] = []
+    remaining = 12_000
+    next_line, next_col = off, col
+    for index in range(off, end):
+        start = col if index == off else 0
+        piece = lines[index][start:]
+        taken = piece[:remaining]
+        chunks.append(taken)
+        remaining -= len(taken)
+        if len(taken) < len(piece):
+            next_line, next_col = index, start + len(taken)
+            break
+        next_line, next_col = index + 1, 0
+        if remaining == 0:
+            break
+    content = "".join(chunks)
+    result: dict[str, Any] = {
+        "read": True, "path": rel, "content": content,
+        "bytes": len(content.encode("utf-8")),
+        "offset": off, "column": col, "total_lines": len(lines),
+        "truncated": next_line < len(lines),
+        "next_offset": next_line, "next_column": next_col,
+    }
 
     if mtime is not None:
         _remember_read(key, mtime, len(lines))
@@ -435,7 +524,9 @@ def list_skill_dir(path: str = ".") -> dict[str, Any]:
     except SandboxError as exc:
         return {"listed": False, "error": str(exc)}
     if not target.exists():
-        return {"listed": True, "path": path, "entries": []}
+        # An empty listing here was read as "exists and is empty" and
+        # reported to the operator as a verified fact (audit, 2026-09-21).
+        return {"listed": False, "error": "no such directory", "path": path}
     if not target.is_dir():
         return {"listed": False, "error": "not a directory", "path": path}
 
@@ -459,7 +550,8 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
     Use this to find where something is defined or used instead of
     reading files one by one. Returns matches as ``{file, line, text}``;
     skips VCS/venv/cache dirs and the model store, binary files, and
-    anything over 1 MB; caps at ``max_results``."""
+    files over 16 MB; caps at ``max_results``. Omitted files are reported
+    in ``skipped_files`` so an incomplete search is never evidence of absence."""
     layout = _require_layout()
     needle = (query or "").lower()
     if not needle:
@@ -471,7 +563,19 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
         # "search my home for .env" prompt walk $HOME: a credential-sweep
         # attempt AND an uninterruptible DoS. Confine to the sandbox like
         # ``list_skill_dir`` does; explicit paths stay ``_resolve_read``-gated.
-        root = layout.skills_dir if path == "." else _resolve_read(path)
+        # Default (".") searches the bound PROJECT when there is one — that
+        # is what "search the codebase" means to anyone using a coding agent.
+        # With no project bound it stays the sandbox skills dir rather than
+        # ``Path.cwd()``: the old cwd default let "search my home for .env"
+        # walk $HOME, which is both a credential sweep and an uninterruptible
+        # DoS. Explicit paths remain ``_resolve_read``-gated either way.
+        if path == ".":
+            from jaeger_agent.core.workspace import get_project_root
+
+            project = get_project_root()
+            root = project if project is not None else layout.skills_dir
+        else:
+            root = _resolve_read(path)
     except SandboxError as exc:
         return {"searched": False, "error": str(exc)}
     # Refuse an over-broad root: the home dir or the filesystem root is the
@@ -491,11 +595,14 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
     # — descending into .venv/.git/the model store — before any filtering).
     _MAX_SCAN = 50_000
     matches: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    scan_limited = False
 
     def _iter_files() -> "Any":
         if root.is_file():
             yield root
             return
+        nonlocal scan_limited
         scanned = 0
         # ``os.walk`` with in-place dir pruning: skip dirs are removed from
         # the descent set so we NEVER walk into them (vs. filtering after a
@@ -505,6 +612,7 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
             for fn in filenames:
                 scanned += 1
                 if scanned > _MAX_SCAN:
+                    scan_limited = True
                     return
                 yield Path(dirpath) / fn
 
@@ -518,12 +626,15 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
         # 2026-07-06).
         try:
             if (not child.is_file()
-                    or is_sensitive_path(child)
-                    or child.stat().st_size > 1_000_000):
+                    or is_sensitive_path(child)):
+                continue
+            if child.stat().st_size > 16_000_000:
+                skipped.append({"file": _display_path(child, layout), "reason": "size limit"})
                 continue
             text = child.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            continue  # unreadable or binary — skip
+            skipped.append({"file": _display_path(child, layout), "reason": "unreadable or binary"})
+            continue
         for lineno, line in enumerate(text.splitlines(), 1):
             if needle in line.lower():
                 matches.append({
@@ -537,7 +648,9 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
             break
     return {
         "searched": True, "query": query, "matches": matches,
-        "count": len(matches), "truncated": len(matches) >= cap,
+        "count": len(matches), "truncated": len(matches) >= cap or scan_limited or bool(skipped),
+        "scan_limited": scan_limited, "skipped_files": skipped[:50],
+        "skipped_count": len(skipped),
     }
 
 
@@ -546,31 +659,35 @@ def search_files(query: str, path: str = ".", max_results: int = 50) -> dict[str
 # Private ``_t_*`` names + explicit ``name=`` override so the gated tool never
 # collides with the ungated logic fn above (used by internal callers).
 # ---------------------------------------------------------------------------
-@register_tool_from_function(name="write_file")
+@register_tool_from_function(name="write_file", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="write_file",
-               summary="write a file in the skills workspace")
+               summary="write a file in the operator's project")
 def _t_write_file(path: str, content: str) -> dict:
-    """Write a text file in the sandboxed skills/ directory. Overwrites
-    if it already exists."""
+    """Write a text file. Relative paths land in the operator's open project
+    (the IDE workspace) when one is selected — use paths relative to it, e.g.
+    `src/app.py`. Otherwise `workspace/...` lands in the instance workspace
+    and a bare name in skills/. Absolute paths work when they are inside one
+    of those roots (the same paths run_shell sees; it starts in the instance
+    root). Overwrites if it already exists."""
     return file_write(path=path, content=content)
 
 
-@register_tool_from_function(name="append_file")
+@register_tool_from_function(name="append_file", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="append_file",
-               summary="append to a file in the skills workspace")
+               summary="append to a file in the operator's project")
 def _t_append_file(path: str, content: str) -> dict:
     """Append text to an existing skills/ file."""
     return append_file(path=path, content=content)
 
 
-@register_tool_from_function(name="patch")
+@register_tool_from_function(name="patch", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="patch",
-               summary="edit a file in the skills workspace")
+               summary="edit a file in the operator's project")
 def _t_patch(path: str, old: str, new: str, replace_all: bool = False) -> dict:
-    """Surgically edit an EXISTING skills/ file by find-and-replace.
+    """Surgically edit an EXISTING file (in the operator's open project) by find-and-replace.
     Prefer this over write_file to change a file you've already
     written — it swaps one region instead of regenerating the whole
     file, so a long file can't be lost to a truncated rewrite. `old`
@@ -580,19 +697,19 @@ def _t_patch(path: str, old: str, new: str, replace_all: bool = False) -> dict:
     return edit_file(path=path, old=old, new=new, replace_all=replace_all)
 
 
-@register_tool_from_function(name="delete_file")
+@register_tool_from_function(name="delete_file", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="delete_file",
-               summary="delete a file from the skills workspace")
+               summary="delete a file from the operator's project")
 def _t_delete_file(path: str) -> dict:
-    """Delete a file from the skills/ directory."""
+    """Delete a file (relative to the operator's open project when one is selected)."""
     return delete_file(path=path)
 
 
-@register_tool_from_function(name="move_file")
+@register_tool_from_function(name="move_file", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="move_file",
-               summary="move a file in the skills workspace")
+               summary="move a file in the operator's project")
 def _t_move_file(src: str, dst: str) -> dict:
     """Move (rename) a file inside the sandboxed skills/ workspace —
     THE tool for "move/organize my files" (screenshots, exports,
@@ -604,10 +721,10 @@ def _t_move_file(src: str, dst: str) -> dict:
     return move_file(src=src, dst=dst)
 
 
-@register_tool_from_function(name="copy_file")
+@register_tool_from_function(name="copy_file", side_effect="external")
 @requires_tier(PermissionTier.WRITE_LOCAL, skill="files",
                operation="copy_file",
-               summary="copy a file in the skills workspace")
+               summary="copy a file in the operator's project")
 def _t_copy_file(src: str, dst: str) -> dict:
     """Copy a file inside the sandboxed skills/ workspace. Same
     sandbox routing as `move_file` for both `src` and `dst`."""
@@ -617,14 +734,16 @@ def _t_copy_file(src: str, dst: str) -> dict:
 @register_tool_from_function(name="read_file", side_effect="read")
 @requires_tier(PermissionTier.READ_ONLY, skill="files", operation="read_file",
                summary="read a workspace file")
-def _t_read_file(path: str, offset: int = 0, limit: int | None = None) -> dict:
+def _t_read_file(path: str, offset: int = 0, limit: int | None = None, column: int = 0) -> dict:
     """Read a text file from ANYWHERE on the machine — your own
     source code, the whole repository you run from, the wider
     system. Absolute paths and `~` work; reading is not sandboxed.
     (Off-limits: the credentials/ store and OS secret files like
     ~/.ssh.) For a large file, page it: `offset` is the 0-based
-    first line, `limit` the line count (default: the whole file)."""
-    return file_read(path=path, offset=offset, limit=limit)
+    first line, `limit` the line count (default: 200). Output is capped at
+    12,000 characters. When truncated, resume using `next_offset` and
+    `next_column` as `offset` and `column`."""
+    return file_read(path=path, offset=offset, limit=limit, column=column)
 
 
 @register_tool_from_function(name="list_skill_dir", side_effect="read")

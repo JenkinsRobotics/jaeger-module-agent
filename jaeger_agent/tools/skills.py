@@ -18,10 +18,6 @@ from jaeger_os.core.tools.tool_registry import register_tool_from_function
 from jaeger_agent.skill_registry import playbook_skills as _pb
 from jaeger_agent.core.workspace import get_layout
 
-# Cap a single skill's instructions so one huge SKILL.md can't blow the
-# context window. Skills run long but rarely past this.
-_MAX_SKILL_CHARS = 16_000
-
 # Recognised linked-file categories inside a skill folder.
 _FILE_CATEGORIES = ("scripts", "references", "templates", "assets")
 
@@ -63,9 +59,7 @@ def _read_skill_file(folder: pathlib.Path, relpath: str) -> dict[str, Any]:
         text = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return {"ok": False, "error": f"couldn't read {relpath}: {exc}"}
-    return {"ok": True, "file": relpath,
-            "content": text[:_MAX_SKILL_CHARS],
-            "truncated": len(text) > _MAX_SKILL_CHARS}
+    return {"ok": True, "file": relpath, "content": text, "truncated": False}
 
 
 def skill(action: str, name: str = "", query: str = "",
@@ -74,7 +68,7 @@ def skill(action: str, name: str = "", query: str = "",
     """Discover and read playbook skills — experienced procedures for a
     task. ``action`` selects the operation:
 
-      - ``list``   — the FULL active catalog: every active skill,
+      - ``list``   — the FULL callable catalog: every installed skill,
         enriched (name · category · description · tier · tools).
         This is the research-step lookup — call it when
         STARTING a non-trivial task to see everything available, then
@@ -92,6 +86,8 @@ def skill(action: str, name: str = "", query: str = "",
       - ``stats``  — usage telemetry: which tools and skills get used.
       - ``curate`` — assess the skill library: which agent-authored
         skills have gone stale. Read-only — reports, archives nothing.
+      - ``audit``  — validate naming, routing descriptions, entrypoint size,
+        aliases, references, and required tools against the live registry.
 
     Reach for a skill when a task is non-trivial and specialized
     ("inspect a codebase", "make an ascii-art banner", "search arxiv")."""
@@ -107,8 +103,12 @@ def skill(action: str, name: str = "", query: str = "",
         from jaeger_agent.skill_registry.curator import run_curation
         return run_curation(apply=False)
 
+    if act in ("audit", "validate", "lint"):
+        from jaeger_agent.skill_registry.skill_audit import audit_catalog
+        return audit_catalog()
+
     if act in ("list", "all", ""):
-        skills = _pb.available_playbooks()
+        skills = _pb.callable_playbooks()
         # Build category counts first — that's the always-cheap
         # part of the response that lets the model decide whether
         # to deepen with category= or search.
@@ -135,7 +135,9 @@ def skill(action: str, name: str = "", query: str = "",
             "skills": [
                 {"name": s.name, "category": s.category,
                  "description": s.description, "tier": s.tier,
-                 "tools": s.requires_tools}
+                 "tools": s.requires_tools,
+                 "lifecycle": getattr(s, "lifecycle", "core"),
+                 "skill_class": getattr(s, "skill_class", "first-class")}
                 for s in page
             ],
         }
@@ -148,7 +150,7 @@ def skill(action: str, name: str = "", query: str = "",
         if not q:
             return {"ok": False, "error": "search needs a query"}
         hits = []
-        for s in _pb.available_playbooks():
+        for s in _pb.callable_playbooks():
             hay = (f"{s.name} {s.description} {s.category} "
                    f"{' '.join(s.tags)}").lower()
             if all(term in hay for term in q.split()):
@@ -187,19 +189,37 @@ def skill(action: str, name: str = "", query: str = "",
         result = {
             "ok": True, "name": s.name, "category": s.category,
             "origin": s.origin,
-            "instructions": content[:_MAX_SKILL_CHARS],
-            "truncated": len(content) > _MAX_SKILL_CHARS,
+            "lifecycle": getattr(s, "lifecycle", "core"),
+            "skill_class": getattr(s, "skill_class", "first-class"),
+            "instructions": content,
+            "truncated": False,
             "folder": str(folder),
             "files": _bucket_skill_files(folder),
         }
         # Advisory prerequisites — surfaced only when declared so the model
         # knows what to load (a toolset) or fall back from before following.
-        if s.platforms:
-            result["platforms"] = s.platforms
-        if s.requires_tools:
-            result["requires_tools"] = s.requires_tools
-        if s.requires_toolsets:
-            result["requires_toolsets"] = s.requires_toolsets
+        platforms = getattr(s, "platforms", ())
+        required_tools = getattr(s, "requires_tools", ())
+        optional_tools = getattr(s, "optional_tools", ())
+        required_plugins = getattr(s, "requires_plugins", ())
+        aliases = getattr(s, "aliases", ())
+        required_toolsets = getattr(s, "requires_toolsets", ())
+        if platforms:
+            result["platforms"] = platforms
+        if required_tools:
+            result["requires_tools"] = required_tools
+        if optional_tools:
+            result["optional_tools"] = optional_tools
+        if required_plugins:
+            result["requires_plugins"] = required_plugins
+            result["plugin_setup"] = (
+                "Before execution, inspect/install the required plugin(s) with "
+                "list_plugins/setup_plugin; do not guess provider tools."
+            )
+        if aliases:
+            result["aliases"] = aliases
+        if required_toolsets:
+            result["requires_toolsets"] = required_toolsets
             # POLISH-4: auto-load the toolsets the skill declares it
             # needs. Without this the model has to round-trip a
             # ``load_tools`` call after every ``skill(view)`` —
@@ -211,7 +231,7 @@ def skill(action: str, name: str = "", query: str = "",
                     active_toolset_names, enable_toolset,
                 )
                 loaded_now: list[str] = []
-                for ts in s.requires_toolsets:
+                for ts in required_toolsets:
                     if enable_toolset(ts):
                         loaded_now.append(ts)
                 if loaded_now:

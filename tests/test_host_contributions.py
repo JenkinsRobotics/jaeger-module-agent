@@ -107,6 +107,7 @@ def test_host_can_force_scoping_for_one_agent_without_process_env(
 ) -> None:
     """A context-tight face scopes locally while ordinary agents stay full."""
     monkeypatch.delenv("JAEGER_TOOLSET_SCOPING", raising=False)
+    toolset_scoping.register_toolset("probeset", [app_tool], "host tools")
     toolset_scoping.reset_toolsets()
     scoped = _agent(tool_visibility=toolset_scoping.scoped_tool_visible)
     ordinary = _agent(tool_visibility=toolset_scoping.tool_visible)

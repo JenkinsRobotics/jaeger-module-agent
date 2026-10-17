@@ -1,8 +1,8 @@
-"""Station 3 — the persona output filter (docs/skills/agentic_runners.md).
+"""Station 3 — the persona output filter (dev/docs/reality/agentic_runners.md).
 
 Workers run vanilla: a character in the execution context costs a 4B ~7
-bench points (measured in JaegerAI, dev/docs/reality/persona_compiler.md —
-that's why assemble.py deliberately omits the persona fragment). The character's voice comes back HERE instead: one
+bench points (measured — that's why assemble.py deliberately omits the
+persona fragment). The character's voice comes back HERE instead: one
 bounded, clean-context call that restyles the FINAL answer only. The
 filter's context is the answer + the compiled character block — no tools,
 no history, no schemas — so personality tokens can never pollute execution.
@@ -95,14 +95,42 @@ def _content_words(text: str) -> set[str]:
     return out
 
 
+_NUMBER_WORDS = dict(zip(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million billion".split(),
+    "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 30 40 50 60 70 80 90 100 1000 1000000 1000000000".split(),
+))
+
+
+def _quantities(text: str) -> set[str]:
+    """Counts, identifiers, versions and measurements cannot be optional style."""
+    result = set()
+    for word in _WORD_RE.findall(text.lower()):
+        if word in _NUMBER_WORDS:
+            result.add(_NUMBER_WORDS[word])
+        elif any(c.isdigit() for c in word):
+            result.add(word)
+    return result
+
+
 def _preserves_content(original: str, styled: str) -> bool:
     """True if ``styled`` retains at least ``_OVERLAP_THRESHOLD`` of the
     original's content words. A restyle may reword freely; it may not
     replace the substance with commentary/analysis about the substance."""
+    if not _quantities(original).issubset(_quantities(styled)):
+        return False
     orig_words = _content_words(original)
     if not orig_words:
         return True
     styled_words = _content_words(styled)
+    # A caveat can contain more words than the answer itself. Overall overlap
+    # used to accept a rewrite that kept only the caveat ("it depends") and
+    # dropped the main fact. Preserve that leading claim when one is qualified.
+    clauses = re.split(r",\s*(?:but|though|although|however|while|yet|except)\b",
+                       original, maxsplit=1, flags=re.IGNORECASE)
+    if len(clauses) == 2:
+        claim = _content_words(clauses[0]) - {"typically", "usually", "generally", "normally"}
+        if not claim.issubset(styled_words):
+            return False
     overlap = len(orig_words & styled_words) / len(orig_words)
     return overlap >= _OVERLAP_THRESHOLD
 

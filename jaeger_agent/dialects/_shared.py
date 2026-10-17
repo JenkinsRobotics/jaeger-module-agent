@@ -249,16 +249,29 @@ def parse_drift_payload(raw: str) -> dict[str, Any] | None:
             if isinstance(parsed, dict):
                 return parsed
     loose = parse_gemma_args(text)
-    if not loose:
-        return None
-    cleaned: dict[str, Any] = {}
-    for key, value in loose.items():
-        if isinstance(key, str):
-            key = key.strip().strip('"').strip("'")
-        if isinstance(value, str):
-            value = value.strip().strip('"').strip("'")
-        cleaned[key] = value
-    return cleaned or None
+    if loose:
+        cleaned: dict[str, Any] = {}
+        for key, value in loose.items():
+            if isinstance(key, str):
+                key = key.strip().strip('"').strip("'")
+            if isinstance(value, str):
+                value = value.strip().strip('"').strip("'")
+            cleaned[key] = value
+        if cleaned:
+            return cleaned
+
+    # Tool call repair pass (code fences, single quotes, Python constants, truncated brackets)
+    try:
+        from jaeger_ai.core.runtime.tool_repair import repair_json_string
+        repaired = repair_json_string(text)
+        if repaired and repaired != text:
+            parsed = json.loads(repaired, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        pass
+
+    return None
 
 
 def payload_to_call(inner: str) -> dict[str, Any] | None:
@@ -310,14 +323,22 @@ def _coerce_args_dict(parsed: Any) -> dict[str, Any] | None:
 def repair_arguments(raw: str) -> tuple[dict[str, Any], bool]:
     """Best-effort repair of a malformed tool-call ``arguments`` JSON
     string the *structured* tool-calling path handed us. Returns
-    ``(args, recovered)``. ``recovered`` is ``False`` only when every
-    pass failed and the caller is getting ``{}`` as a last resort — so
-    it can record the parse failure instead of swallowing it silently.
+    ``(args, recovered)``.
 
-    Conservative on purpose: fixes drift we've actually observed (Gemma
-    special-token quotes, literal control chars, trailing commas, wholly
-    single-quoted blobs, Python ``None``/``null``) then hands off to the
-    tolerant Gemma parser rather than guessing further.
+    ``recovered=True`` means the dict is a *lossless* parse of what the
+    model emitted (strict JSON, trailing-comma, quote-swap, Gemma
+    special-token quotes, double-encoded string, or the Gemma loose
+    parser). The structured tool_calls path trusts that dict.
+
+    ``recovered=False`` means every lossless pass failed. The dict may
+    still be a *lossy* reconstruction (truncated JSON whose braces we
+    invented, or ``{}`` as a last resort). The XML drift path can use
+    the dict; the structured path must NOT — it should stash the raw
+    string as ``_raw_arguments`` so the dispatcher surfaces a parse
+    error instead of calling the tool with silently truncated fields.
+    That ``recovered=True`` on a cut-off ``content`` value is the
+    lethal case: write_file succeeds, the ledger ticks, the file is
+    wrong.
     """
     s = (raw or "").strip()
     if not s or s.lower() in ("none", "null"):
@@ -349,6 +370,7 @@ def repair_arguments(raw: str) -> tuple[dict[str, Any], bool]:
     # string values ALONGSIDE other malformations, where the
     # strict=False pass above wasn't enough on its own.
     balanced = _balance_brackets(cleaned)
+    truncated = balanced != cleaned
     for candidate in (
         balanced,
         _escape_ctrl_in_json_strings(balanced),
@@ -361,7 +383,9 @@ def repair_arguments(raw: str) -> tuple[dict[str, Any], bool]:
             continue
         coerced = _coerce_args_dict(parsed)
         if coerced is not None:
-            return coerced, True
+            # Invented closers are a guess, not a parse. Callers that
+            # dispatch tools must treat this as unrecovered.
+            return coerced, not truncated
 
     loose = parse_gemma_args(s)
     if loose:

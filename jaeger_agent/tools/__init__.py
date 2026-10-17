@@ -3,8 +3,8 @@
 Mirrors python_pydantic_ai/core/tools/ for cross-framework structural
 parity. Use either form:
 
-    from jaeger_os.agent import tools             # then tools.get_time(...)
-    from jaeger_os.agent.tools import get_time    # direct import
+    from jaeger_agent import tools             # then tools.get_time(...)
+    from jaeger_agent.tools import get_time    # direct import
 
 Categories:
 
@@ -15,8 +15,8 @@ Categories:
   • scheduling.py     — schedule_prompt, list_schedules, cancel_schedule
   • web.py            — web_search, get_weather
   • code.py           — run_python
-  • speak.py          — speak (text or workspace file), warm_tts
-  • vision.py         — look_at, generate_image (Moondream2 + SDXL-Turbo)
+  • speak.py          — speak (text or workspace file), warm_kokoro
+  • vision.py         — look_at, generate_image (native mmproj + SDXL-Turbo)
   • host.py           — open_on_host (macOS: URL / file / app)
   • credentials.py    — get_credential, list_credentials
   • delegation.py     — ask_user, help_me, delegate
@@ -57,6 +57,7 @@ from .meta import describe_tool, load_tools
 
 # Memory
 from .memory import forget, list_facts, memory, recall, remember, search_memory
+from .insights import record_insight, recall_insight
 
 # Scheduling
 from .scheduling import cancel_schedule, list_schedules, schedule_prompt
@@ -67,6 +68,9 @@ from .web import get_weather, web_fetch, web_search
 # Code execution
 from .code import run_python, run_shell
 
+# Container management
+from .container import container
+
 # Remote execution — ssh wrapper for the agent to run on other hosts
 from .remote import ssh_exec
 
@@ -75,12 +79,8 @@ from .speak import (
     KOKORO_LANG,
     KOKORO_SAMPLE_RATE,
     KOKORO_VOICE,
-    TTS_DEFAULT_LANG,
-    TTS_DEFAULT_SAMPLE_RATE,
-    TTS_DEFAULT_VOICE,
     speak,
     warm_kokoro,
-    warm_tts,
 )
 
 # Avatar (0.5 — AnimationNode driving)
@@ -103,6 +103,7 @@ from .credentials import get_credential, list_credentials
 
 # Coordination / meta
 from .delegation import CAPABILITY_SUMMARY, ask_user, help_me
+from .call_agent import call_agent, get_agent_result
 
 # Plugin awareness
 from .plugins import list_plugins, setup_plugin
@@ -145,6 +146,8 @@ from .reflect import reflect
 
 # In-session task list (planning scratchpad)
 from .todo import reset_todos, todo
+from .plan import normalize_plan, wait_for  # registers update_plan + wait
+from . import pty_exec  # noqa: F401  (registers exec_command, write_stdin, kill_command)
 
 # Self-update — the agent editing its own identity.yaml / soul.md
 from .identity_tools import set_name, update_soul
@@ -167,7 +170,17 @@ from .shortcuts import list_shortcuts, run_shortcut
 from .spotlight import spotlight_search
 from .calendar import create_event, get_events
 from .contacts import lookup_contact
-from .email import send_email
+from .email import (
+    batch_move,
+    list_mail,
+    list_mailboxes,
+    move_mail,
+    plan_mail_triage,
+    read_mail,
+    schedule_inbox_sweeper,
+    send_email,
+    sweep_mail,
+)
 from .clipboard import clipboard_read, clipboard_write
 from .notify import notify
 from .system_control import system_control
@@ -179,8 +192,6 @@ __all__ = [
     # framework wiring
     "bind", "get_layout",
     "SandboxError", "_audit", "_require_layout", "_resolve_under", "git_autocommit",
-    # introspection and reflection
-    "describe_tool", "load_tools", "reflect",
     # files
     "file_write", "file_read", "list_skill_dir", "append_file", "delete_file",
     "edit_file", "search_files", "reset_read_tracker", "move_file", "copy_file",
@@ -188,19 +199,19 @@ __all__ = [
     "get_time", "calculate", "system_status",
     # memory
     "remember", "recall", "forget", "list_facts", "search_memory", "memory",
+    "record_insight", "recall_insight",
     # scheduling
     "schedule_prompt", "list_schedules", "cancel_schedule",
     # web
     "web_search", "web_fetch", "get_weather",
     # code
     "run_python", "run_shell",
+    # container management
+    "container",
     # remote execution
     "ssh_exec",
     # speak
-    "speak", "warm_tts",
-    "TTS_DEFAULT_VOICE", "TTS_DEFAULT_LANG", "TTS_DEFAULT_SAMPLE_RATE",
-    # 1.0.2 aliases — the engine-named spellings, kept one release.
-    "warm_kokoro",
+    "speak", "warm_kokoro",
     "KOKORO_VOICE", "KOKORO_LANG", "KOKORO_SAMPLE_RATE",
     # vision
     "look_at", "generate_image",
@@ -209,7 +220,7 @@ __all__ = [
     # credentials
     "get_credential", "list_credentials",
     # delegation
-    "ask_user", "help_me", "CAPABILITY_SUMMARY",
+    "ask_user", "help_me", "CAPABILITY_SUMMARY", "call_agent", "get_agent_result",
     # plugins
     "list_plugins", "setup_plugin",
     # audio input
@@ -244,7 +255,9 @@ __all__ = [
     "spotlight_search",
     "get_events", "create_event",
     "lookup_contact",
-    "send_email",
+    "send_email", "list_mailboxes", "list_mail", "read_mail",
+    "plan_mail_triage", "move_mail",
+    "batch_move", "sweep_mail", "schedule_inbox_sweeper",
     "clipboard_read", "clipboard_write",
     "notify",
     "system_control",

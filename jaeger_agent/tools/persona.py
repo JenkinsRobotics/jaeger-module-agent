@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from jaeger_agent.core.workspace import _require_layout
+from jaeger_agent.core.workspace import _require_layout, get_layout
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 
 _LAYERS = ("hexaco", "special", "expression", "domains")
 
 
 def _active() -> Any:
-    from jaeger_ai.characters.character import active_character
+    from jaeger_ai.features.personality.character import active_character
     try:
         return active_character(_require_layout().root)
     except Exception:  # noqa: BLE001
@@ -30,7 +30,7 @@ def read_traits() -> dict[str, Any]:
     c = _active()
     if c is None:
         return {"ok": False, "error": "no active character selected"}
-    from jaeger_ai.characters.character import layer_items
+    from jaeger_ai.features.personality.character import layer_items
     p = c.personality
     return {"ok": True, "character": c.name,
             **{k: dict(layer_items(getattr(p, k))) for k in _LAYERS}}
@@ -48,7 +48,7 @@ def adjust_trait(layer: str, field: str, value: float) -> dict[str, Any]:
     layer = (layer or "").lower().strip()
     if layer not in _LAYERS:
         return {"ok": False, "error": f"unknown layer {layer!r}; one of {list(_LAYERS)}"}
-    from jaeger_ai.characters.character import layer_items, save_character_traits
+    from jaeger_ai.features.personality.character import layer_items, save_character_traits
     cur = dict(layer_items(getattr(c.personality, layer)))
     if field not in cur:
         return {"ok": False, "error": f"unknown {layer} trait {field!r}; options: {sorted(cur)}"}
@@ -73,15 +73,15 @@ def _t_remember_person(name: str, note: str = "", like: str = "", access: str = 
       • channel + handle — link a messaging account to them (e.g. "telegram"
         + their chat id), so you know which accounts are this person.
     Distinct from CHARACTERS (the personas YOU play). Returns the profile."""
-    from jaeger_agent.memory import memory as mem
-    try:
-        person = mem.upsert_person(
-            name, note=note, like=like, access=(access or None),
-            channel=channel.strip().lower(), handle=handle,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "person": person}
+    from dataclasses import asdict
+    from jaeger_ai.core import people
+    layout = get_layout()
+    if layout is None:
+        return {"ok": False, "error": "no instance bound"}
+    p = people.upsert_person(layout, name=name, note=note, like=like,
+                             access=(access or None), channel=channel.strip().lower(),
+                             handle=handle)
+    return {"ok": True, "person": asdict(p)}
 
 
 @register_tool_from_function(name="get_person", side_effect="read")
@@ -89,25 +89,22 @@ def _t_get_person(name: str) -> dict:
     """Look up a person's profile (by name / alias) from your person index —
     answer "who is X?" / "what does X like?" from FACT, not a guess. Returns
     the profile or {found: false}."""
-    from jaeger_agent.memory import memory as mem
-    try:
-        person = mem.get_person(name)
-    except Exception:  # noqa: BLE001 — an unbound instance is "not found"
-        person = None
-    if person is None:
+    from dataclasses import asdict
+    from jaeger_ai.core import people
+    layout = get_layout()
+    p = people.find_by_name(layout, name) if layout is not None else None
+    if p is None:
         return {"found": False, "name": name}
-    return {"found": True, "person": person}
+    return {"found": True, "person": asdict(p)}
 
 
 @register_tool_from_function(name="list_people", side_effect="read")
 def _t_list_people() -> dict:
     """List everyone in your person index — names + access level. Use to
     recall who you know."""
-    from jaeger_agent.memory import memory as mem
-    try:
-        everyone = mem.list_people()
-    except Exception:  # noqa: BLE001
+    from jaeger_ai.core import people
+    layout = get_layout()
+    if layout is None:
         return {"people": []}
-    return {"people": [{"id": p.get("id", ""), "name": p.get("name", ""),
-                        "access": p.get("access", "member")}
-                       for p in everyone]}
+    return {"people": [{"id": p.id, "name": p.name, "access": p.access}
+                       for p in people.list_people(layout)]}

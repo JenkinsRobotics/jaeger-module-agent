@@ -54,8 +54,19 @@ def bind(layout: Any) -> None:
     ``.legacy`` after a successful import — and the lazy importers
     need to know where to look.
     """
+    from pathlib import Path
+
     from jaeger_agent.memory import sqlite_store
-    mem = layout.memory_dir
+    mem = getattr(layout, "memory_dir", None)
+    if mem is None:
+        root = getattr(layout, "root", None)
+        if root is not None:
+            mem = Path(root) / "memory"
+        else:
+            return
+    if not isinstance(mem, (str, Path)):
+        return  # a stand-in layout (tests, previews): never open a store under it
+    mem = Path(mem)
     mem.mkdir(parents=True, exist_ok=True)
     _state["facts_path"] = mem / "facts.json"
     _state["episodic_path"] = mem / "episodic.jsonl"
@@ -264,6 +275,31 @@ def remember(key: str, value: str, category: str | None = None,
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (subj, key, value, cat, src, tag_str, note, now),
         )
+
+
+def remember_if_absent(key: str, value: str, *, subject: str, category: str) -> str:
+    """Atomically admit an immutable record; return the persisted value.
+
+    Concurrent retries cannot overwrite an existing ID or append duplicate
+    history. Uses the same facts table/source partition as ordinary memory.
+    """
+    from jaeger_agent.memory import sqlite_store
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    subj, src = _norm_subject(subject), current_memory_source()
+    with sqlite_store.writer() as conn:
+        inserted = conn.execute(
+            "INSERT OR IGNORE INTO facts "
+            "(subject,key,value,category,source,tags,note,created_at,updated_at) VALUES (?,?,?,?,?,'','',?,?)",
+            (subj, key, value, category, src, now, now),
+        )
+        if inserted.rowcount:
+            conn.execute(
+                "INSERT INTO fact_log (subject,key,value,category,source,tags,note,ts) VALUES (?,?,?,?,?,'','',?)",
+                (subj, key, value, category, src, now),
+            )
+        return str(conn.execute(
+            "SELECT value FROM facts WHERE subject=? AND key=? AND source=?", (subj, key, src),
+        ).fetchone()["value"])
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -725,7 +761,7 @@ def _ensure_embeddings_up_to_date() -> int:
 def search_memory(query: str, k: int = 5) -> list[dict[str, Any]]:
     """Return up to ``k`` semantically-closest episodic entries for
     ``query``. Each result has ``user`` / ``answer`` / ``timestamp``
-    / ``score`` (cosine, 0-1).
+    / ``session`` (the conversation it came from) / ``score`` (cosine, 0-1).
 
     Encodes missing embeddings on first call after new turns have
     been appended — incremental, not a full rebuild. Uses
@@ -746,7 +782,7 @@ def search_memory(query: str, k: int = 5) -> list[dict[str, Any]]:
 
     conn = sqlite_store.connection()
     rows = conn.execute(
-        "SELECT e.id, e.user, e.answer, e.ts, em.vector "
+        "SELECT e.id, e.session_key, e.user, e.answer, e.ts, em.vector "
         "FROM episodic e "
         "JOIN episodic_embeddings em ON em.episodic_id = e.id"
     ).fetchall()
@@ -774,6 +810,7 @@ def search_memory(query: str, k: int = 5) -> list[dict[str, Any]]:
             "user": row["user"] or "",
             "answer": row["answer"] or "",
             "timestamp": row["ts"],
+            "session": row["session_key"] or "",
             "score": float(scores[int(i)]),
         })
     return out
@@ -1298,217 +1335,3 @@ def load_identity_string(layout: Any) -> str:
         f"Role: {ident.role}\n"
         f"Voice: {ident.personality}"
     )
-
-
-def search_sessions(
-    query: str = "",
-    *,
-    session_key: str | None = None,
-    limit: int = 10,
-    since: str | None = None,
-) -> list[dict[str, Any]]:
-    """Search past turns across conversations — the agent reviewing its
-    own history.
-
-    ``episodic`` has held one row per turn, keyed by ``session_key``,
-    since the store was written; nothing exposed it for retrieval beyond
-    "the last N of the CURRENT session". Recalling what happened in a
-    conversation you are no longer in is a memory operation, and it is
-    the one the agent could not do.
-
-    ``query`` matches the user's message OR the answer, case-insensitively.
-    Empty ``query`` lists recent turns instead of searching, which is what
-    "what was I doing yesterday" needs.
-
-    ``session_key`` narrows to one conversation; ``since`` is an ISO date
-    or timestamp lower bound. Newest first — when reviewing history the
-    recent past is almost always the interesting part.
-    """
-    from jaeger_agent.memory import sqlite_store
-
-    limit = max(1, min(int(limit or 10), 100))
-    conn = sqlite_store.connection()
-
-    where: list[str] = []
-    params: list[Any] = []
-    if (query or "").strip():
-        # LIKE, not FTS: the episodic table has no FTS index and adding
-        # one is a migration. A conversation history is thousands of rows,
-        # not millions — LIKE is fast enough and cannot fall out of sync.
-        # ponytail: swap for FTS5 if a corpus ever makes this slow.
-        like = f"%{query.strip()}%"
-        where.append("(user LIKE ? OR answer LIKE ?)")
-        params += [like, like]
-    if session_key:
-        where.append("session_key = ?")
-        params.append(session_key)
-    if since:
-        where.append("ts >= ?")
-        params.append(since)
-
-    sql = (
-        "SELECT id, session_key, ts, user, answer, latency_ms, first_decision "
-        "FROM episodic"
-    )
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
-    params.append(limit)
-
-    out: list[dict[str, Any]] = []
-    for row in conn.execute(sql, tuple(params)).fetchall():
-        out.append({
-            "id": row["id"],
-            "session": row["session_key"],
-            "ts": row["ts"],
-            "user": row["user"] or "",
-            "answer": row["answer"] or "",
-            "latency_ms": row["latency_ms"],
-            "first_decision": row["first_decision"] or "",
-        })
-    return out
-
-
-def list_sessions(limit: int = 20) -> list[dict[str, Any]]:
-    """Conversations the agent has had, newest first.
-
-    Derived from ``episodic`` rather than the ``sessions`` table: that
-    table is only populated when a host bothers to open and close a
-    session, while episodic rows are written by the turn loop itself and
-    are therefore always true.
-    """
-    from jaeger_agent.memory import sqlite_store
-
-    limit = max(1, min(int(limit or 20), 200))
-    rows = sqlite_store.connection().execute(
-        "SELECT session_key, COUNT(*) AS turns, MIN(ts) AS first_ts, "
-        "MAX(ts) AS last_ts, MAX(id) AS last_id "
-        "FROM episodic GROUP BY session_key "
-        "ORDER BY last_id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    return [
-        {
-            "session": r["session_key"],
-            "turns": r["turns"],
-            "first_ts": r["first_ts"],
-            "last_ts": r["last_ts"],
-        }
-        for r in rows
-    ]
-
-
-# ── people ─────────────────────────────────────────────────────────
-# A person is a SUBJECT with facts, which is what the facts table has
-# always modelled — ``(subject, key, value, category)`` with an index on
-# each. So the person index needs no new table and no migration: it is
-# one JSON profile row per person under ``category='person'``.
-#
-# The profile is a single blob rather than a fact per field because the
-# interesting parts (aliases, handles, likes) are LISTS, and the facts
-# table is key/value with an overwrite-by-key primary key. One row per
-# alias would need synthetic keys and lose ordering.
-# ponytail: one blob per person; split into fields if anything ever needs
-# to query across people by a single attribute.
-
-_PERSON_CATEGORY = "person"
-_PERSON_KEY = "profile"
-
-
-def _person_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def upsert_person(
-    name: str,
-    *,
-    note: str = "",
-    like: str = "",
-    access: str | None = None,
-    channel: str = "",
-    handle: str = "",
-) -> dict[str, Any]:
-    """Create or update a person. Appends notes and likes, replaces access,
-    and links a messaging handle to the person who owns it.
-
-    Returns the whole profile so a caller can show what it now knows.
-    """
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("a person needs a name")
-
-    person = get_person(name) or {
-        "id": re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "person",
-        "name": name,
-        "aliases": [],
-        "handles": {},
-        "access": "member",
-        "likes": [],
-        "notes": [],
-        "created_at": _person_now(),
-    }
-    if note.strip():
-        person["notes"].append(note.strip())
-    if like.strip():
-        person["likes"].append(like.strip())
-    if access:
-        person["access"] = access.strip().lower()
-    if channel.strip() and handle.strip():
-        ids = person["handles"].setdefault(channel.strip().lower(), [])
-        if handle.strip() not in ids:
-            ids.append(handle.strip())
-    person["updated_at"] = _person_now()
-
-    remember(
-        _PERSON_KEY, json.dumps(person),
-        category=_PERSON_CATEGORY, subject=name,
-    )
-    return person
-
-
-def get_person(name: str) -> dict[str, Any] | None:
-    """A person's profile by name or alias, or ``None``.
-
-    Falls back to an alias/handle scan only when the direct lookup misses,
-    so the common case stays one indexed read.
-    """
-    name = (name or "").strip()
-    if not name:
-        return None
-    raw = recall(_PERSON_KEY, subject=name)
-    if raw:
-        try:
-            return json.loads(raw)
-        except (TypeError, ValueError):
-            return None
-    lowered = name.lower()
-    for person in list_people():
-        if lowered in {a.lower() for a in person.get("aliases", [])}:
-            return person
-        for ids in person.get("handles", {}).values():
-            if name in ids:
-                return person
-    return None
-
-
-def list_people() -> list[dict[str, Any]]:
-    """Everyone in the person index, newest-updated first."""
-    from jaeger_agent.memory import sqlite_store
-
-    rows = sqlite_store.connection().execute(
-        "SELECT value FROM facts WHERE category = ? AND key = ? "
-        "ORDER BY updated_at DESC",
-        (_PERSON_CATEGORY, _PERSON_KEY),
-    ).fetchall()
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        try:
-            out.append(json.loads(row["value"]))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-def forget_person(name: str) -> bool:
-    """Drop a person from the index."""
-    return forget(_PERSON_KEY, subject=(name or "").strip())

@@ -26,31 +26,83 @@ visible by default (fail-open): a new tool is never silently hidden.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 
 
 def _scoping_enabled() -> bool:
-    """Toolset scoping is OPT-IN (off by default).
+    """Lean tool surface. Opt-in.
 
-    History: we flipped it ON in May 2026 after adding ``describe_tool``
-    and the catalog, hoping the new pattern would offset the routing
-    regression seen with naive scoping. Direct A/B against the v5
-    historical baseline showed Gemma 4 26B-A4B routing dropped from
-    **100% → 67.6%** under the new lean default; Qwen3.6-35B-A3B was
-    largely unaffected. Conclusion: the lean surface is a real win for
-    context budget but a real loss for routing on some models, and we
-    can't commit to it as a global default. It stays OPT-IN until
-    auto-load-on-intent (a follow-up that picks toolsets without an
-    explicit meta-step) lands and re-bench shows no regression.
-
-    ``JAEGER_TOOLSET_SCOPING=1`` enables it for context-tight runs
-    (small ctx windows, tight budgets); ``JAEGER_FULL_TOOLS=1`` is
-    redundant in the OFF default but still honoured as a kill-switch."""
+    Default OFF: every registered tool is visible, including MCP tools
+    loaded at boot. A/B on Gemma 4 showed scoping dropped routing
+    100% → 67.6%. ``JAEGER_TOOLSET_SCOPING=1`` enables CORE + load_tools.
+    ``JAEGER_FULL_TOOLS=1`` forces the full surface even when scoping is on.
+    """
     if os.environ.get("JAEGER_FULL_TOOLS", "").strip().lower() in (
         "1", "true", "yes", "on",
     ):
         return False
-    val = os.environ.get("JAEGER_TOOLSET_SCOPING", "0").strip().lower()
+    val = os.environ.get("JAEGER_TOOLSET_SCOPING", "").strip().lower()
     return val in ("1", "true", "yes", "on")
+
+
+# Deterministic first-pass routing, equivalent to Hermes focus/toolset
+# profiles.  The model still has list_tools/describe_tool/load_tools in CORE
+# for ambiguous requests; these hints avoid spending an extra meta-tool turn
+# for clear intent.  Matching is intentionally conservative and additive.
+_INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
+    "files": (r"\b(files?|folders?|director(?:y|ies)|patch|rename|copy|move|read|write|disk|space|path|content)\b",),
+    "code": (r"\b(code|python|swift|javascript|typescript|shell|terminal|command|test suite|debug|package|disk|system|process|cpu|memory usage|df|ls|cat|ps|kill|curl|git|ping|port)\b",),
+    "containers": (r"\b(container|containers|containerized)\b",),
+    "media": (r"\b(image|video|audio|speech|voice|camera|microphone|listen)\b",),
+    "web": (r"\b(weather|forecast)\b",),
+    "sessions": (r"\b(conversation|session|chat history)\b",),
+    "board": (r"\b(board|kanban|card)\b",),
+    "agent_notes": (r"\b(notes?|remember|preferences?|keep track)\b",),
+    "frameworks": (r"\b(claude code|claude|codex|gemini|antigravity|grok|other agents?|frameworks?)\b",),
+    "scheduling": (r"\b(schedule|cron|remind|recurring)\b",),
+    "background": (r"\b(background|long[- ]running|process|job)\b",),
+    "identity": (r"\b(your name|identity|soul|persona)\b",),
+    "skills": (r"\b(skill|deep think|reflection)\b",),
+    "computer_use": (r"\b(click|screen|browser|website|open app|computer)\b",),
+    "credentials": (r"\b(credential|api key|secret|password)\b",),
+    "plugins": (r"\b(plugin|discord|telegram|slack|message)\b",),
+    "email": (r"\b(e-?mail|inbox|mailbox)\b",),
+    "smart_home": (r"\b(home assistant|smart home|light|thermostat)\b",),
+    "people": (r"\b(person|people|profile|contact notes)\b",),
+    "models": (r"\b(model|ollama|lm studio|context window|autonomy mode)\b",),
+    "bench": (r"\b(benchmark|eval|evaluation)\b",),
+    "delegates": (r"\b(delegate|delegation|external agent|agent runtime)\b",),
+    "missions": (r"\b(mission|goal|plan steps?)\b",),
+    "history_import": (r"\b(import|migrate).*(?:history|sessions?|transcripts?)\b",),
+    "cost_tracking": (r"\b(budget|usage cost|spending limit)\b",),
+    "knowledge_library": (r"\b(knowledge library|document library|index documents?)\b",),
+    "caldav": (r"\b(caldav|remote calendar)\b",),
+    "insta360": (r"\b(insta360|camera gimbal|deskview)\b",),
+    "ares_migration": (r"\b(ares).*(?:migrate|migration|backup|retire|retirement)\b",),
+    "diagnostics": (r"\b(diagnostic|self[- ]check|system health|cpu|disk|uptime)\b",),
+    "shortcuts": (r"\b(shortcut|shortcuts\.app)\b",),
+    "spotlight": (r"\b(spotlight|find .* on (?:my |the )?mac)\b",),
+    "calendar": (r"\b(calendar|event|appointment|meeting)\b",),
+    "contacts": (r"\b(contacts?\.app|phone number|contact details)\b",),
+    "clipboard": (r"\b(clipboard|pasteboard|copy this)\b",),
+    "notifications": (r"\b(notification|notify me|banner)\b",),
+    "system_control": (r"\b(volume|brightness|dark mode|do not disturb|prevent sleep)\b",),
+    "media_control": (r"\b(now playing|playback|pause music|spotify|music\.app)\b",),
+    "ocr": (r"\b(ocr|extract text from|read this (?:image|pdf))\b",),
+}
+
+
+def infer_toolsets(text: str) -> set[str]:
+    """Return task-relevant toolsets without an LLM routing call."""
+    clean = (text or "").lower()
+    return {
+        toolset
+        for toolset, patterns in _INTENT_PATTERNS.items()
+        if any(re.search(pattern, clean) for pattern in patterns)
+    }
 
 
 # CORE — always visible when scoping is on. Umbrellas where they route
@@ -75,7 +127,7 @@ CORE: frozenset[str] = frozenset({
     # granular verbs (forget / list_facts / search_memory) load via the
     # ``memory_granular`` toolset. ``recall`` is CORE because scoped runs
     # showed the umbrella alone lost the plain "what did I say" cases.
-    "memory", "recall",
+    "memory", "recall", "record_insight", "recall_insight",
     # Tasks + board. Individual board verbs (a local model routes over
     # distinct named tools better than one ``action=`` umbrella); the
     # common two are CORE, the rest load via the ``board`` toolset.
@@ -89,6 +141,9 @@ CORE: frozenset[str] = frozenset({
     # can FIND any tool (list_tools) and bring it in (load_tools) without
     # ever force-fitting a visible tool for one it hasn't looked up.
     "list_tools", "load_tools", "describe_tool",
+    # Mail.app reads — CORE so "organize my inbox" hits list_mail instead
+    # of execute_code + guessed AppleScript (the 60-tool hang).
+    "list_mailboxes", "list_mail", "read_mail", "plan_mail_triage",
     # ``self_check`` (the agent's doctor) lives in the ``diagnostics``
     # toolset, not CORE — loaded on demand like ``run_benchmark``. The
     # old ``system_health`` was kept out entirely because "do a self
@@ -143,7 +198,10 @@ TOOLSETS: dict[str, frozenset[str]] = {
         # on intent (terminal, ssh, venv, dep install).
         "run_in_venv", "terminal", "remote_terminal",
         "install_package", "list_venv_packages",
+        # Long-running command sessions (start, poll/type, kill).
+        "exec_command", "write_stdin", "kill_command",
     }),
+    "containers": frozenset({"container"}),
     "media": frozenset({
         "text_to_speech", "listen", "vision_analyze", "image_generate",
         # fal.ai cloud generation (plugins/ai_gen) — the paid counterpart
@@ -169,10 +227,32 @@ TOOLSETS: dict[str, frozenset[str]] = {
         # favour of the umbrella ``memory(action=…)`` (in CORE).
         "remember", "recall", "forget", "list_facts", "search_memory",
     }),
+    # Planning primitives (Codex ``update_plan`` / ``wait``): stateless display
+    # of the model's plan and a cancellable bounded pause.
+    "planning": frozenset({"update_plan", "wait"}),
+    # A specialist agent's own NOTES.md (bound by the Gateway per turn).
+    "agent_notes": frozenset({"agent_notes"}),
+    # Other agent frameworks on this Mac (owner grants; see core/frameworks).
+    "frameworks": frozenset({"framework_read", "framework_delegate"}),
+    # Ask the operator's editor: open a file at a line, list Problems, read what is open.
+    "ide": frozenset({"ide_context", "ide_open_file", "ide_diagnostics"}),
     "sessions": frozenset({"session_search"}),
     "board": frozenset({
         # board_add / board_view are CORE; the rest load on intent.
         "board_move", "board_update", "board_delete",
+    }),
+    # Multi-agent coordination (ported from hermes-agent). Deliberately a
+    # SEPARATE toolset from ``board``: the board verbs are single-agent task
+    # planning that any turn may reach for, while these are the worker /
+    # orchestrator handoff protocol and stay off a normal chat turn's schema
+    # entirely. They are additionally gated by ``kanban._kanban_mode``, so
+    # loading the toolset is necessary but not sufficient.
+    "kanban": frozenset({
+        "kanban_show", "kanban_list", "kanban_create", "kanban_complete",
+        "kanban_block", "kanban_unblock", "kanban_heartbeat",
+        "kanban_comment", "kanban_link", "kanban_request_review",
+        "kanban_request_changes", "kanban_attach", "kanban_attach_url",
+        "kanban_attachments",
     }),
     "scheduling": frozenset({
         "schedule_prompt", "list_schedules", "cancel_schedule",
@@ -192,6 +272,7 @@ TOOLSETS: dict[str, frozenset[str]] = {
         # is in CORE; the lower-level operators load here.
         "reload_skills", "package_skill", "benchmark_skill",
         "propose_deep_think_task", "list_deep_think_queue",
+        "queue_background_task", "background_task_status",
         # Skill self-improvement: usage journal + the review trigger/toggle +
         # the revision log (feeds + records the Deep Think review loop).
         "skill_note", "skill_notes", "request_skill_review", "set_skill_review",
@@ -200,9 +281,14 @@ TOOLSETS: dict[str, frozenset[str]] = {
         "reflect",
     }),
     "computer_use": frozenset({"computer_use", "browser"}),
-    "credentials": frozenset({"get_credential", "list_credentials", "set_credential"}),
+    "credentials": frozenset({
+        "get_credential", "list_credentials", "set_credential", "request_secret",
+    }),
     "plugins": frozenset({"list_plugins", "setup_plugin", "activate_plugin", "send_message", "certify_admin"}),
-    "email": frozenset({"send_email"}),
+    "email": frozenset({
+        "send_email", "move_mail", "batch_move",
+        "sweep_mail", "schedule_inbox_sweeper",
+    }),
     "smart_home": frozenset({
         # Home Assistant plugin tools (jaeger_os/plugins/homeassistant) —
         # registered on import like send_message; loaded on intent.
@@ -228,6 +314,29 @@ TOOLSETS: dict[str, frozenset[str]] = {
     "system_control": frozenset({"system_control"}),
     "media_control": frozenset({"media_control", "now_playing"}),
     "ocr": frozenset({"ocr_file"}),
+    "delegates": frozenset({"list_delegate_runtimes", "call_agent", "get_agent_result"}),
+    "finance": frozenset({
+        "finance_summary", "finance_audit", "finance_transactions",
+        "finance_inbox", "finance_sync", "finance_briefing",
+    }),
+    "missions": frozenset({
+        "mission_create", "mission_list", "mission_status", "mission_transition",
+    }),
+    "history_import": frozenset({"history_import_scan", "history_import"}),
+    "cost_tracking": frozenset({"budget_set", "budget_status"}),
+    "knowledge_library": frozenset({
+        "library_add", "library_index", "library_search", "library_read",
+    }),
+    "caldav": frozenset({
+        "caldav_configure", "caldav_sync", "caldav_events",
+        "caldav_put_event", "caldav_delete_event",
+    }),
+    "insta360": frozenset({
+        "insta360_status", "insta360_capture", "insta360_record_audio", "insta360_aim",
+    }),
+    "ares_migration": frozenset({
+        "ares_migration_audit", "ares_migrate", "ares_backup", "ares_retirement_rehearsal",
+    }),
 }
 
 # One-line description per built-in class — for the load_tools catalog.
@@ -238,8 +347,14 @@ TOOLSET_SUMMARY: dict[str, str] = {
     "avatar": "avatar face + animation timelines (BETA — dev mode only)",
     "web": "weather lookups (web_search / web_extract are always-on)",
     "memory_granular": "the pre-umbrella remember/recall/forget tools",
+    "planning": "show and update a step plan (update_plan); wait for a bounded time",
+    "agent_notes": "a specialist agent's own persistent notes (read / append / replace)",
+    "frameworks": "read other agent frameworks' history/memory and hand them tasks (owner-granted)",
+    "ide": "the operator's editor: open a file at a line, list Problems, read what is open",
     "sessions": "search and inspect canonical conversation history",
     "board": "board_move / board_update / board_delete (board_add + board_view are CORE)",
+    "kanban": "multi-agent worker/orchestrator protocol — claim, heartbeat, "
+              "block, review, link and attach on shared board cards",
     "scheduling": "schedule, list, cancel cron prompts",
     "background": "long-running background processes; open URLs/apps",
     "identity": "set_name and update_soul — modify the agent's own identity",
@@ -247,7 +362,7 @@ TOOLSET_SUMMARY: dict[str, str] = {
     "computer_use": "Mac-driving + browser automation",
     "credentials": "list, read, and save stored credentials",
     "plugins": "list, set up + activate plugins; send messages",
-    "email": "send an email (Mail.app AppleScript, or himalaya CLI when installed)",
+    "email": "Mail.app writes: move_mail / batch_move / sweep_mail + send_email",
     "smart_home": "Home Assistant — list/read smart-home devices, call services",
     "people": "person index — profiles of people you know (name/likes/access)",
     "models": "list/download models; set_mode (normal/high/deep-sleep); "
@@ -263,7 +378,104 @@ TOOLSET_SUMMARY: dict[str, str] = {
     "system_control": "volume, brightness, dark mode, do-not-disturb, prevent-sleep",
     "media_control": "control + read Music.app/Spotify playback",
     "ocr": "extract text from an image or PDF (Vision framework)",
+    "delegates": "inspect runtimes and request standing specialist handoffs",
+    "finance": "inspect financial summaries, audit results and transactions",
+    "missions": "create and track durable missions, goals, and plan steps",
+    "history_import": "scan and import ARES and external-agent transcripts",
+    "cost_tracking": "configure and inspect runtime usage and cost budgets",
+    "knowledge_library": "register, index, search, and read local document collections",
+    "caldav": "configure, synchronize, and update generic CalDAV calendars",
+    "insta360": "inspect and control Insta360 camera, microphone, and gimbal hardware",
+    "ares_migration": "audit, import, back up, and rehearse retirement of ARES state",
 }
+
+# ── Untrusted-content surface (ported from hermes-agent) ─────────────
+#
+# Ported from hermes-agent ``toolsets.py`` (``_HERMES_WEBHOOK_SAFE_TOOLS``,
+# the ``hermes-webhook`` profile). hermes-agent is MIT licensed:
+#
+#   Copyright (c) 2025 Nous Research
+#   Permission is hereby granted, free of charge, to any person obtaining
+#   a copy of this software and associated documentation files (the
+#   "Software"), to deal in the Software without restriction, including
+#   without limitation the rights to use, copy, modify, merge, publish,
+#   distribute, sublicense, and/or sell copies of the Software.
+#
+# Donor rationale, verbatim from that file: "Webhook events may originate
+# from untrusted third-party content (for example, public PR titles/
+# comments). Keep the default webhook toolset intentionally constrained
+# to avoid local file/system execution by prompt injection."
+#
+# ADAPTATION. hermes-agent gates this by resolving a per-platform
+# *profile* at schema-build time, because every entry point there picks a
+# named toolset. Jaeger has no per-surface profile layer — visibility runs
+# through :func:`tool_visible` — so the gate lives there instead, and it
+# must hold under two Jaeger-specific conditions the donor never faced:
+#
+#   1. Toolset scoping is OFF by default here (``_scoping_enabled()``
+#      returns False unless JAEGER_TOOLSET_SCOPING is set). A gate that
+#      lived behind that flag would be inert in the default configuration,
+#      which is precisely the configuration a webhook runs in.
+#   2. Jaeger's scoping fails OPEN — an unclassified tool is visible. That
+#      is the right default for a new built-in and the wrong one for
+#      attacker-controlled input.
+#
+# So this gate is checked FIRST in ``tool_visible`` and fails CLOSED: in
+# untrusted mode the answer is membership in UNTRUSTED_SAFE and nothing
+# else. ``JAEGER_FULL_TOOLS`` does not lift it either — that switch exists
+# for debugging a local session, not for re-opening an injection path.
+UNTRUSTED_SAFE: frozenset[str] = frozenset({
+    "web_search", "web_extract", "vision_analyze", "clarify",
+})
+
+# Deliberately NOT registered in TOOLSETS/TOOLSET_SUMMARY: membership
+# there would make it reachable from ``load_tools``/``enable_toolset``,
+# and a surface the model can name is a surface prompt injection can ask
+# for. The meta-tools themselves (``load_tools``, ``describe_tool``,
+# ``list_tools``) are CORE but not in UNTRUSTED_SAFE, so an untrusted turn
+# cannot even enumerate what it is missing, let alone widen into it.
+_untrusted: ContextVar[bool] = ContextVar("jaeger_untrusted_content", default=False)
+
+
+def is_untrusted_content() -> bool:
+    """True when this turn is processing attacker-controlled input."""
+    return _untrusted.get()
+
+
+def set_untrusted_content(value: bool) -> Token[bool]:
+    """Mark the current context trusted/untrusted. Returns the reset token.
+
+    Prefer :func:`untrusted_content` — this exists for callers that cross
+    an async boundary and cannot hold a ``with`` block open.
+    """
+    return _untrusted.set(bool(value))
+
+
+def reset_untrusted_content(token: Token[bool]) -> None:
+    """Undo a :func:`set_untrusted_content` call."""
+    _untrusted.reset(token)
+
+
+@contextmanager
+def untrusted_content() -> Iterator[None]:
+    """Run a turn against the constrained surface.
+
+    Wrap any ingress carrying third-party text — webhook payloads, PR
+    titles and comments, scraped pages replayed into a turn::
+
+        with untrusted_content():
+            result = agent.run_turn(webhook_body)
+
+    Nesting is safe, and the flag is a ContextVar, so a delegated child
+    running in another task inherits it rather than silently escaping to
+    the full surface.
+    """
+    token = _untrusted.set(True)
+    try:
+        yield
+    finally:
+        _untrusted.reset(token)
+
 
 # Skill toolsets — populated at runtime by the skill loader. A skill is
 # its own toolset; the loader records exactly what tools it registered.
@@ -295,11 +507,6 @@ def register_skill_toolset(name: str, tools: list[str],
     _SKILL_SUMMARY[name] = summary or f"the {name} skill"
 
 
-#: Host-facing alias. The function above is named for its first caller,
-#: the skill loader, but since 1.0.7 a host application registers its own
-#: toolsets through the same path — and asking an app to call something
-#: called ``register_skill_toolset`` to declare tools that are not a
-#: skill's is a name that will mislead every time it is read.
 register_toolset = register_skill_toolset
 
 
@@ -309,7 +516,16 @@ def reset_toolsets() -> None:
 
 
 def enable_toolset(name: str) -> bool:
-    """Make a toolset (built-in class or skill) visible. False if unknown."""
+    """Make a toolset (built-in class or skill) visible. False if unknown.
+
+    Refuses outright in untrusted-content mode: ``load_tools`` is the
+    model-facing caller, so honouring a widening request there would let
+    injected text talk its way back to the full surface one toolset at a
+    time. The refusal is silent-by-return (False), matching the unknown-
+    toolset case, so the model learns nothing about what it cannot reach.
+    """
+    if _untrusted.get():
+        return False
     name = (name or "").strip().lower()
     if name in TOOLSETS or name in _SKILL_TOOLSETS:
         _active.add(name)
@@ -333,7 +549,17 @@ def _members(toolset: str) -> frozenset[str]:
 
 def tool_visible(name: str) -> bool:
     """Whether tool ``name`` is currently exposed to the model. With
-    scoping OFF (the default), every tool is visible."""
+    scoping OFF (the default), every tool is visible.
+
+    The one exception is untrusted-content mode, which is checked before
+    everything else and fails closed — see :data:`UNTRUSTED_SAFE`. It is
+    deliberately ahead of the ``_scoping_enabled()`` early return and of
+    the ``JAEGER_FULL_TOOLS`` escape hatch inside it: a webhook turn runs
+    in the default configuration, where scoping is off, so a gate placed
+    after that check would never fire on the path that needs it.
+    """
+    if _untrusted.get():
+        return name in UNTRUSTED_SAFE
     if not _scoping_enabled():
         return True
     return scoped_tool_visible(name)
@@ -347,6 +573,8 @@ def scoped_tool_visible(name: str) -> bool:
     seen by the host's ordinary chat sessions.  ``load_tools`` still widens
     the same registered catalogue; only schema visibility is forced on.
     """
+    if _untrusted.get():
+        return name in UNTRUSTED_SAFE
     if name in CORE:
         return True
     for ts in _active:

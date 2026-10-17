@@ -51,6 +51,8 @@ directly::
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -126,25 +128,61 @@ def is_interrupted() -> bool:
     Safe to call from any thread, including a tool worker thread. A tool
     polls this in its work loop and bails out cooperatively.
     """
-    return _interrupt.is_set()
+    if _interrupt.is_set():
+        return True
+    # The turn's own cancel event, bound by the agent while it runs a tool. This is how
+    # a per-request cancel (or Global Stop) reaches a command that has already started.
+    from jaeger_agent.core.cancellation import current_cancellation
+    event = current_cancellation()
+    return event is not None and event.is_set()
 
 
 def raise_if_interrupted() -> None:
     """Raise :class:`ToolInterrupted` if the current turn was cancelled."""
-    if _interrupt.is_set():
+    if is_interrupted():
         raise ToolInterrupted()
 
 
+def _signal_tree(proc: subprocess.Popen, sig: int) -> None:
+    """Send ``sig`` to the child's whole process GROUP, falling back to the
+    child alone.
+
+    Signalling only the direct child is not enough. ``run_shell`` runs
+    ``/bin/sh -c "<cmd>"``, and whether the shell *execs* the final command
+    (replacing itself, so the child IS the command) or *forks* it is an
+    implementation detail that differs between shells — macOS's bash execs,
+    Linux's dash forks. When it forks, terminating the shell leaves the
+    grandchild alive still holding the write end of our stdout/stderr pipes,
+    so the drain below blocks until that grandchild exits on its own. A
+    ``run_shell("sleep 10")`` interrupted after 0.3s took the full 10
+    seconds to return. Popen sets ``start_new_session=True``, so the child
+    leads its own process group and one killpg reaches every descendant.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        # Group already gone, or we never got our own session — the direct
+        # child is still worth signalling.
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def _drain(proc: subprocess.Popen, *, text: bool) -> tuple[Any, Any]:  # noqa: ANN401
-    """Terminate ``proc`` and collect whatever output it produced."""
+    """Terminate ``proc`` (and everything it spawned) and collect its output."""
     empty: Any = "" if text else b""
     try:
-        proc.terminate()
+        _signal_tree(proc, signal.SIGTERM)
         try:
             out, err = proc.communicate(timeout=2.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
+            _signal_tree(proc, signal.SIGKILL)
+            out, err = proc.communicate(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        # A grandchild we could not reach still holds the pipes. Do not block
+        # the turn on it — the caller wants OUT, now.
+        return empty, empty
     except Exception:  # noqa: BLE001 — best-effort cleanup, never re-raise
         return empty, empty
     return out or empty, err or empty
@@ -179,6 +217,9 @@ def run_interruptible(
         text=text,
         cwd=cwd,
         env=dict(env) if env is not None else None,
+        # Give the child its own process group so an interrupt can reach the
+        # whole tree with one killpg — see _signal_tree.
+        start_new_session=True,
     )
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:

@@ -44,6 +44,14 @@ class AgentCallbacks:
     # streaming fire this if the callback is installed.
     stream_delta: Callable[[str], None] | None = None
 
+    # MODEL deliberation — the contents of a ``<think>`` block or an
+    # extended-thinking channel — fired once per assistant message that
+    # carried any. Distinct from ``thinking`` above, which reports what the
+    # AGENT LOOP did ("[mid-turn steer injected: …]"); this is what the model
+    # actually deliberated. The adapters strip it out of the visible answer, so
+    # without this callback the text is produced and then discarded.
+    reasoning: Callable[[str], None] | None = None
+
     # Per-turn step. ``index`` is the agent-loop iteration count,
     # ``message`` is the assistant's response that just landed.
     step: Callable[[int, Message], None] | None = None
@@ -91,6 +99,14 @@ class AgentCallbacks:
     # inactivity timers paused during long generations.
     heartbeat: Callable[[float], None] | None = None
 
+    # Dependency Inversion: Injected usage telemetry callbacks
+    record_skill_route: Callable[..., None] | None = None
+    record_skill: Callable[..., None] | None = None
+    record_skill_outcome: Callable[..., None] | None = None
+    record_model_usage: Callable[..., None] | None = None
+    record_tool: Callable[..., None] | None = None
+
+
     # ── safe-invocation helpers ──────────────────────────────────────
     # Always call these from the agent loop rather than reaching for the
     # field directly: they no-op on missing callbacks and swallow handler
@@ -110,6 +126,14 @@ class AgentCallbacks:
         try:
             self.thinking(state)
         except Exception:  # noqa: BLE001
+            pass
+
+    def on_reasoning(self, text: str) -> None:
+        if self.reasoning is None:
+            return
+        try:
+            self.reasoning(text)
+        except Exception:  # noqa: BLE001 — callback must never break the turn
             pass
 
     def on_stream_delta(self, token: str) -> None:
@@ -190,5 +214,102 @@ class AgentCallbacks:
         except Exception:  # noqa: BLE001
             pass
 
+    def on_record_skill_route(self, name: str | None, reason: str | None = None) -> None:
+        if self.record_skill_route is not None:
+            try:
+                self.record_skill_route(name, reason=reason)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import sys
+                mod = sys.modules.get("jaeger_ai.core.runtime.usage_stats")
+                if mod and hasattr(mod, "record_skill_route"):
+                    mod.record_skill_route(name, reason=reason)
+            except Exception:
+                pass
+
+    def on_record_skill(self, name: str) -> None:
+        if self.record_skill is not None:
+            try:
+                self.record_skill(name)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import sys
+                mod = sys.modules.get("jaeger_ai.core.runtime.usage_stats")
+                if mod and hasattr(mod, "record_skill"):
+                    mod.record_skill(name)
+            except Exception:
+                pass
+
+    def on_record_skill_outcome(self, name: str, outcome: str = "smooth", halt_reason: str | None = None) -> None:
+        if self.record_skill_outcome is not None:
+            try:
+                self.record_skill_outcome(name, outcome=outcome, halt_reason=halt_reason)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import sys
+                mod = sys.modules.get("jaeger_ai.core.runtime.usage_stats")
+                if mod and hasattr(mod, "record_skill_outcome"):
+                    mod.record_skill_outcome(name, outcome=outcome, halt_reason=halt_reason)
+            except Exception:
+                pass
+
+    def on_record_model_usage(
+        self,
+        provider: str,
+        model: str,
+        *,
+        prompt_tokens: int = 0,
+        cached_prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        if self.record_model_usage is not None:
+            try:
+                self.record_model_usage(
+                    provider,
+                    model,
+                    prompt_tokens=prompt_tokens,
+                    cached_prompt_tokens=cached_prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import sys
+                mod = sys.modules.get("jaeger_ai.core.runtime.usage_stats")
+                if mod and hasattr(mod, "record_model_usage"):
+                    mod.record_model_usage(
+                        provider,
+                        model,
+                        prompt_tokens=prompt_tokens,
+                        cached_prompt_tokens=cached_prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
+            except Exception:
+                pass
+
+    def on_record_tool(self, name: str, ok: bool = True, elapsed: float = 0.0) -> None:
+        if self.record_tool is not None:
+            try:
+                self.record_tool(name, ok=ok, elapsed=elapsed)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            try:
+                import sys
+                mod = sys.modules.get("jaeger_ai.core.runtime.usage_stats")
+                if mod and hasattr(mod, "record_tool"):
+                    mod.record_tool(name, ok=ok, elapsed=elapsed)
+            except Exception:
+                pass
+
+
 
 __all__ = ["AgentCallbacks"]
+

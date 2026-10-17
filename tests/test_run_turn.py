@@ -20,7 +20,7 @@ from jaeger_agent import (
     clear_registry,
     register_tool,
 )
-from jaeger_agent.loop.loop_backstop import MAX_IDENTICAL_CALLS
+from jaeger_agent.loop.loop_backstop import MAX_IDENTICAL_CALLS, MAX_TOOL_CALLS
 
 
 # ── stub adapter ───────────────────────────────────────────────────
@@ -153,6 +153,72 @@ def test_parallel_tool_calls_dispatched_in_one_assistant_turn():
     assert all('"pong"' in m["content"] for m in tool_rows)
 
 
+def test_parallel_batch_never_executes_past_hard_tool_budget():
+    executed: list[str] = []
+
+    @register_tool("bounded_read", "Read.", _SmallArgs, side_effect="read")
+    def _bounded(value: str = "x") -> dict:
+        executed.append(value)
+        return {"ok": True, "value": value}
+
+    requested = MAX_TOOL_CALLS + 6
+    adapter = _ScriptedAdapter([
+        {
+            "role": "assistant",
+            "content": "reading",
+            "tool_calls": [
+                {"id": f"c{i}", "name": "bounded_read", "arguments": {"value": str(i)}}
+                for i in range(requested)
+            ],
+        },
+        {"role": "assistant", "content": "I inspected the allowed items; six remained unread."},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    result = agent.run_turn("read a bounded batch")
+
+    assert len(executed) == MAX_TOOL_CALLS
+    rows = [m for m in agent.messages if m["role"] == "tool"]
+    assert len(rows) == requested
+    assert sum("tool_budget_exhausted" in row["content"] for row in rows) == 6
+    assert agent.last_halt_reason == (
+        f"made {MAX_TOOL_CALLS} tool calls in a single turn"
+    )
+    assert result == "I inspected the allowed items; six remained unread."
+    assert adapter.call_count == 2
+    assert adapter.last_tools_count == 0
+
+
+def test_configured_tool_budget_replaces_legacy_global_limit():
+    executed: list[str] = []
+
+    @register_tool("adaptive_read", "Read.", _SmallArgs, side_effect="read")
+    def _adaptive(value: str = "x") -> dict:
+        executed.append(value)
+        return {"ok": True, "value": value}
+
+    configured = MAX_TOOL_CALLS + 6
+    adapter = _ScriptedAdapter([
+        {
+            "role": "assistant",
+            "content": "reading",
+            "tool_calls": [
+                {"id": f"c{i}", "name": "adaptive_read", "arguments": {"value": str(i)}}
+                for i in range(configured)
+            ],
+        },
+        {"role": "assistant", "content": "all inspected"},
+    ])
+    from jaeger_agent.loop.turn_budget import TurnBudgetLimits
+
+    agent = JaegerAgent(
+        adapter=adapter,
+        turn_budget_limits=TurnBudgetLimits(
+            max_tool_calls=configured, max_iterations=50,
+        ),
+    )
+    assert agent.run_turn("read the complete batch") == "all inspected"
+    assert len(executed) == configured
+    assert agent.last_halt_reason == f"made {configured} tool calls in a single turn"
 def test_parallel_memory_reads_are_forced_serial() -> None:
     """Two recalls must not concurrently use the singleton SQLite handle."""
     @register_tool("recall", "Recall.", _SmallArgs, side_effect="read")
@@ -188,6 +254,30 @@ def test_unknown_tool_becomes_tool_error_result_loop_continues():
     assert result == "ok, I'll skip that"
     tool_row = next(m for m in agent.messages if m["role"] == "tool")
     assert "unknown tool" in tool_row["content"]
+
+
+def test_identical_static_read_is_cached_across_iterations():
+    executed = 0
+
+    @register_tool("read_file", "Read.", _SmallArgs, side_effect="read")
+    def _read(value: str = "x") -> dict:
+        nonlocal executed
+        executed += 1
+        return {"ok": True, "content": "stable"}
+
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "name": "read_file", "arguments": {"value": "same"}},
+        ]},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c2", "name": "read_file", "arguments": {"value": "same"}},
+        ]},
+        {"role": "assistant", "content": "done"},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("read the same file twice") == "done"
+    assert executed == 1
+    assert agent.turn_budget.tool_calls == 2  # model calls remain observable
 
 
 def test_bad_args_validation_error_becomes_tool_result_not_crash():
@@ -264,7 +354,7 @@ def test_identical_tool_call_loop_trips_backstop():
 
 def test_max_iterations_caps_runaway_loop():
     """When the model never stops calling tools, ``max_iterations`` is
-    the hard ceiling — no model call beyond it."""
+    the hard tool-loop ceiling, followed by one tool-free grace call."""
     @register_tool("nibble", "Varies args each time.", _SmallArgs)
     def _impl(value: str = "x") -> dict:
         return {"ok": True}
@@ -279,13 +369,43 @@ def test_max_iterations_caps_runaway_loop():
                 {"id": f"id{i}", "name": "nibble", "arguments": {"value": f"v{i}"}},
             ],
         }
-        for i in range(20)
+        for i in range(3)
     ]
-    agent = JaegerAgent(adapter=_ScriptedAdapter(script), max_iterations=3)
-    agent.run_turn("never stop")
+    script.append({"role": "assistant", "content": "I stopped after three checks."})
+    adapter = _ScriptedAdapter(script)
+    agent = JaegerAgent(adapter=adapter, max_iterations=3)
+    result = agent.run_turn("never stop")
     assert agent.last_iteration_count == 3
     assert agent.last_halt_reason is not None
     assert "max_iterations" in agent.last_halt_reason
+    assert result == "I stopped after three checks."
+    assert adapter.call_count == 4
+    assert adapter.last_tools_count == 0
+
+
+def test_wind_down_retries_once_when_first_summary_is_empty():
+    @register_tool("nibble", "One bounded check.", _SmallArgs)
+    def _impl(value: str = "x") -> dict:
+        return {"ok": True, "value": value}
+
+    adapter = _ScriptedAdapter([
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "id1", "name": "nibble", "arguments": {"value": "v1"}},
+            ],
+        },
+        {"role": "assistant", "content": ""},
+        {"role": "assistant", "content": "I completed one check before stopping."},
+    ])
+    agent = JaegerAgent(adapter=adapter, max_iterations=1)
+
+    result = agent.run_turn("check until the turn budget stops you")
+
+    assert result == "I completed one check before stopping."
+    assert adapter.call_count == 3
+    assert adapter.last_tools_count == 0
 
 
 # ── cancel + interrupt ─────────────────────────────────────────────
@@ -304,6 +424,37 @@ def test_interrupt_set_before_loop_halts_immediately():
     # turn completes normally.
     assert result == "would have answered"
     assert agent.interrupted is False
+
+
+def test_host_cancel_signal_set_before_turn_survives_the_per_turn_reset():
+    """A host-owned cancel signal (a request cancelled before its agent
+    started) is NOT cleared by ``run_turn``'s reset, unlike the agent's own
+    stale interrupt above: the turn halts before any model call."""
+    import threading
+
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": "must not be produced"},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    signal = threading.Event()
+    signal.set()
+    agent.bind_cancel_signal(signal)
+
+    agent.run_turn("hello")
+
+    assert agent.last_halt_reason == "interrupted"
+    assert adapter.call_count == 0
+    assert signal.is_set(), "the loop must never clear a host-owned signal"
+
+
+def test_unset_host_cancel_signal_does_not_affect_the_turn():
+    import threading
+
+    adapter = _ScriptedAdapter([{"role": "assistant", "content": "answered"}])
+    agent = JaegerAgent(adapter=adapter)
+    agent.bind_cancel_signal(threading.Event())
+    assert agent.run_turn("hello") == "answered"
+    assert agent.last_halt_reason is None
 
 
 def test_interrupt_mid_loop_halts_after_current_call():
@@ -482,6 +633,7 @@ def _install_fake_usage_stats(monkeypatch) -> list[tuple]:
     return calls
 
 
+
 def test_dispatch_counts_a_successful_tool_call(monkeypatch):
     """``usage.json``'s tool counters stayed empty because nothing ever
     called ``record_tool``; dispatch is the one place that must."""
@@ -561,3 +713,42 @@ def test_telemetry_failure_never_breaks_the_turn(monkeypatch):
         {"role": "assistant", "content": "it is noon"},
     ])
     assert JaegerAgent(adapter=adapter).run_turn("what time is it?") == "it is noon"
+
+
+def test_error_only_results_are_failures_and_preserve_partial_summary():
+    from jaeger_agent.loop.callbacks import AgentCallbacks
+    observed = []
+    @register_tool('lookup', 'Search unavailable.', _SmallArgs)
+    def fail(value='x'):
+        return {'error': 'service offline'}
+    adapter = _ScriptedAdapter([
+        {'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': str(i), 'name': 'lookup', 'arguments': {'value': str(i)}}]}
+        for i in range(2)
+    ] + [{'role': 'assistant', 'content': 'The lookup failed; evidence is incomplete.'}])
+    agent = JaegerAgent(adapter=adapter, callbacks=AgentCallbacks(
+        tool_done=lambda name, args, result, ok, error, elapsed: observed.append((ok, error))))
+    result = agent.run_turn('research')
+    assert result == 'The lookup failed; evidence is incomplete.'
+    assert observed == [(False, 'service offline')] * 2
+    assert adapter.last_tools_count == 0
+    assert 'failure 2 times' in agent.last_halt_reason
+    assert 'lookup' not in agent._turn_tool_successes
+
+
+def test_failed_tool_result_carries_a_recovery_hint():
+    """2026-10-09: a failed call reaches the model with a structured
+    ``recovery`` line (cause, change something, never the identical call)."""
+    @register_tool("flaky_read", "Read.", _SmallArgs, side_effect="read")
+    def _flaky(value: str = "x") -> dict:
+        return {"ok": False, "error": "No such file or directory: notes.txt"}
+
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "name": "flaky_read", "arguments": {"value": "a"}}]},
+        {"role": "assistant", "content": "it does not exist"},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("read it") == "it does not exist"
+    tool_row = next(m for m in agent.messages if m["role"] == "tool")
+    assert "No such file" in tool_row["content"] and "Do not repeat the identical call" in tool_row["content"]

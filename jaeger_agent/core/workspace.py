@@ -13,6 +13,7 @@ category files focused on their tools, free of cross-skill plumbing.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -37,21 +38,32 @@ _layout: InstanceLayout | None = None
 # ``workspace.location`` field; left None when the user wants the
 # default in-instance location.
 _workspace_override: Path | None = None
+# The PROJECT the agent is currently working in — the directory a surface
+# means when it says "switch workspace". Distinct from
+# ``_workspace_override``, which only decides where ``workspace/...`` writes
+# land inside the sandbox.
+#
+# Before this existed the two were conflated, and the consequence was that a
+# workspace switch changed nothing an agent could observe: ``run_shell`` ran in
+# a throwaway tempdir, relative reads resolved against wherever the process was
+# launched, and ``grep_files(".")`` searched the instance's skills directory.
+# The selector moved a value that no tool consumed.
+from contextvars import ContextVar
+
+# The PROJECT the agent is currently working in — thread-safe ContextVar (Hermes pattern)
+_PROJECT_ROOT_UNSET = object()
+_project_root_var: ContextVar[Path | None | object] = ContextVar(
+    "project_root", default=_PROJECT_ROOT_UNSET
+)
+_project_root_global_fallback: Path | None = None
 
 
 def bind(layout: InstanceLayout,
-         *, workspace_override: Path | str | None = None) -> None:
-    """Wire all tool I/O to a specific instance dir. Called once at startup.
-
-    ``workspace_override`` (INST-11) — when non-None, all writes to
-    ``workspace/...`` land at this absolute path instead of
-    ``<instance>/workspace/``. Useful when the user wants easy Finder
-    / Spotlight access to generated outputs (e.g.
-    ``~/Documents/Jaeger Outputs/``). The override path is created
-    on bind if it doesn't exist.
-    """
+         *, workspace_override: Path | str | None = None,
+         project_root: Path | str | None = None) -> None:
+    """Wire all tool I/O to a specific instance dir. Called once at startup."""
     from jaeger_agent.memory import memory as mem
-    global _layout, _workspace_override
+    global _layout, _workspace_override, _project_root_global_fallback
     _layout = layout
     if workspace_override is not None:
         path = Path(workspace_override).expanduser().resolve()
@@ -59,7 +71,46 @@ def bind(layout: InstanceLayout,
         _workspace_override = path
     else:
         _workspace_override = None
+    if project_root is not None:
+        root = Path(project_root).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError(f"project_root is not a directory: {root}")
+        _project_root_var.set(root)
+        _project_root_global_fallback = root
+    else:
+        _project_root_var.set(None)
+        _project_root_global_fallback = None
     mem.bind(layout)
+
+
+def get_project_root() -> Path | None:
+    """The directory the agent is working in, or None when unbound (thread-safe ContextVar)."""
+    val = _project_root_var.get()
+    if val is _PROJECT_ROOT_UNSET:
+        return _project_root_global_fallback
+    return val  # type: ignore[return-value]
+
+
+def set_project_root(path: Path | str | None) -> None:
+    """Rebind the project for the current session/thread without re-binding the whole instance."""
+    if path is None:
+        _project_root_var.set(None)
+        return
+    root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"project_root is not a directory: {root}")
+    _project_root_var.set(root)
+
+
+@contextlib.contextmanager
+def project_scope(path: Path | str | None):
+    """Request-local project; never leak a client's workspace into another turn."""
+    token = _project_root_var.set(None)
+    try:
+        set_project_root(path)
+        yield
+    finally:
+        _project_root_var.reset(token)
 
 
 class DefaultWorkspace:
@@ -70,26 +121,27 @@ class DefaultWorkspace:
     exists so an embedder is not forced to write a layout class before
     ``read_file`` works.
 
-    Rooted at ``<cwd>/.jaeger_agent`` on purpose. A brain that scatters
-    state into ``~`` or a temp directory is one you cannot inspect,
-    commit, or delete alongside the project it belongs to; a robot's
-    workspace lives with the robot's code. Pass ``root=`` for anywhere
-    else.
+    Default state lives below the external operator state directory. A host
+    can pass an explicit root for an isolated instance or project workspace.
     """
 
     def __init__(self, root: Path | str | None = None) -> None:
-        self.root = Path(root or Path.cwd() / ".jaeger_agent").expanduser().resolve()
+        import os
+        state_root = (os.environ.get("JAEGER_STATE_DIR") or os.environ.get("JAEGER_HOME")
+                      or str(Path.home() / ".jaeger"))
+        self.root = Path(root or Path(state_root) / "agent").expanduser().resolve()
         self.logs_dir = self.root / "logs"
         self.skills_dir = self.root / "skills"
         self.memory_dir = self.root / "memory"
         self.workspace_dir = self.root / "workspace"
+        self.run_dir = self.root / "run"
         self.audit_log_path = self.logs_dir / "audit.log"
         self.config_path = self.root / "config.yaml"
         self.identity_path = self.root / "identity.yaml"
 
     def create(self) -> "DefaultWorkspace":
         for directory in (self.logs_dir, self.skills_dir,
-                          self.memory_dir, self.workspace_dir):
+                          self.memory_dir, self.workspace_dir, self.run_dir):
             directory.mkdir(parents=True, exist_ok=True)
         return self
 
@@ -123,7 +175,7 @@ def _require_layout() -> InstanceLayout:
     if _layout is None:
         raise RuntimeError(
             "no workspace bound — call jaeger_agent.core.workspace.ensure_bound() "
-            "for a default at <cwd>/.jaeger_agent, or bind(layout) to use "
+            "for a default under the operator state directory, or bind(layout) to use "
             "your own"
         )
     return _layout
@@ -235,6 +287,46 @@ def _resolve_under(root: Path, path: str) -> Path:
     return full
 
 
+def writable_roots() -> list[Path]:
+    """Roots an absolute write path may land in. A bound project is an
+    explicit, contained write scope, so it is the only root then; otherwise
+    the effective workspace dir and the instance skills dir."""
+    project = get_project_root()
+    if project is not None:
+        return [project.resolve()]
+    layout = _require_layout()
+    return [r.resolve() for r in (get_effective_workspace_dir(), layout.skills_dir)]
+
+
+_INSTANCE_PROTECTED = frozenset({
+    "identity.yaml", "config.yaml", "manifest.json", "permissions.json",
+    "credentials", "memory", "logs", "run",
+})
+
+
+def _resolve_absolute_write(p: Path) -> Path:
+    full = p.resolve()
+    roots = writable_roots()
+    instance_root = getattr(_require_layout(), "root", None)
+    instance_root = Path(instance_root).resolve() if instance_root else None
+    if instance_root is not None and full.is_relative_to(instance_root):
+        rel = full.relative_to(instance_root).parts
+        # Even if a workspace override points at (or above) the instance
+        # root, its control files and secrets are never write targets.
+        if not rel or rel[0] in _INSTANCE_PROTECTED or "credentials" in rel:
+            raise SandboxError(f"{str(p)!r} is a protected instance path")
+    for root in roots:
+        if full == root or full.is_relative_to(root):
+            if "credentials" in full.relative_to(root).parts:
+                break
+            return full
+    raise SandboxError(
+        f"{str(p)!r} is outside the writable roots ("
+        + ", ".join(str(r) for r in roots)
+        + "); write under one of them, e.g. workspace/<name>"
+    )
+
+
 def _resolve_write(path: str) -> Path:
     """Resolve a path for an agent WRITE operation. Picks the
     sandbox root from the lead path component (INST-11):
@@ -260,7 +352,22 @@ def _resolve_write(path: str) -> Path:
     if not path:
         raise SandboxError("path must be non-empty")
     p = Path(path)
+    if p.is_absolute() or path.startswith("~"):
+        # One path rule for every tool (capability run 2026-10-09): the
+        # shell runs from the instance root and prints absolute paths, so
+        # the write tools take an absolute path too, as long as it lands
+        # inside a writable root. Resolving first means a symlink or ``..``
+        # cannot smuggle the target out.
+        return _resolve_absolute_write(Path(path).expanduser())
     # Lead component picks the sandbox root.
+    project = get_project_root()
+    if project is not None and (not p.parts or p.parts[0] not in {"workspace", "skills"}):
+        # The client-selected project is an explicit write scope. Resolve
+        # symlinks/traversal through the same sandbox guard as workspace/.
+        candidate = (project / p).resolve()
+        if not candidate.is_relative_to(project):
+            raise SandboxError("path escapes the selected project")
+        return candidate
     if p.parts and p.parts[0] == "workspace":
         # Strip the ``workspace/`` prefix BEFORE passing to
         # ``_resolve_under``. The leading-strip inside that helper
@@ -271,7 +378,48 @@ def _resolve_write(path: str) -> Path:
         # or similar. Explicit strip keeps the routing predictable.
         rest = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(".")
         return _resolve_under(get_effective_workspace_dir(), str(rest))
-    return _resolve_under(layout.skills_dir, path)
+    # Option A (validated): a bare path that ALREADY exists in the
+    # workspace is a workspace write. New bare names still land in
+    # skills/ so authored skills keep working. The stricter
+    # alternative — never writing a bare name to workspace, even
+    # when the file is sitting there — broke "append to the files
+    # you just listed" for batch jobs seeded in workspace/.
+    if p.parts and p.parts[0] != "skills":
+        try:
+            existing = _resolve_under(get_effective_workspace_dir(), path)
+        except SandboxError:
+            existing = None
+        if existing is not None and existing.exists():
+            return existing
+    target = _resolve_under(layout.skills_dir, path)
+    if not target.exists():
+        # The path doesn't exist as a new-skill-file candidate under
+        # skills_dir — before treating it as "create a new file here",
+        # check whether it's actually a REAL file elsewhere (repo/
+        # framework code, e.g. packages/jaeger-agent/...). Reads are
+        # unconfined (see _resolve_read), so read_file(path) succeeds on
+        # framework files while this write path silently re-roots under
+        # skills_dir and 404s — the model sees "read confirms the text is
+        # there" and "patch says not found" as contradictory signals and
+        # loops (verified: dispatcher session 2026-09-22 03:06-03:11,
+        # card_6c9153233c and card_14425a5598 both hit this — "patch
+        # returning 'not found' despite the text being present in
+        # read_file" — 2 identical patch failures + 4 identical
+        # workspace_read calls before the loop backstop halted the turn).
+        # Raise a clear, distinct error instead of a misleading "not
+        # found" so the model can switch strategy on the first try.
+        try:
+            real = _resolve_read(path)
+        except SandboxError:
+            real = None
+        if real is not None and real.exists() and real != target:
+            raise SandboxError(
+                f"{path!r} exists but is outside the writable sandbox — "
+                "write tools only reach workspace/... or skills/... "
+                "(this looks like framework/repo code; edit it with "
+                "terminal/execute_code instead)"
+            )
+    return target
 
 
 def _resolve_read(path: str) -> Path:
@@ -294,8 +442,18 @@ def _resolve_read(path: str) -> Path:
     if p.is_absolute():
         full = p.resolve()
     else:
-        full = (Path.cwd() / p).resolve()
-        if not full.exists() and _layout is not None:
+        # Project root first when one is bound. A relative read like
+        # ``src/main.py`` means "in the project I am working on"; resolving it
+        # against ``Path.cwd()`` meant "wherever this process happened to be
+        # launched", which for an app opened from Finder is the user's home.
+        # Falls through to the old cwd behaviour when nothing is bound.
+        full = None
+        project_root = get_project_root()
+        if project_root is not None:
+            full = (project_root / p).resolve()
+        if full is None:
+            full = (Path.cwd() / p).resolve()
+        if project_root is None and not full.exists() and _layout is not None:
             # Fall back through the instance-relative roots a WRITE could
             # have targeted, so a bare relative name round-trips with the
             # write tools. ``_resolve_write`` sends bare names (e.g.

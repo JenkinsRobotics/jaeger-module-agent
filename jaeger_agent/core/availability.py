@@ -117,6 +117,10 @@ _PLUGIN_READY_OVERRIDES: dict[str, list[str]] = {}
 # whose module has been removed entirely, instead of falling back to
 # the plugin mechanism's fail-open default.
 _TOOL_TO_MODULE: dict[str, str] = {
+    "text_to_speech":   "kokoro_tts",
+    "speak":            "kokoro_tts",    # legacy alias
+    "warm_kokoro":      "kokoro_tts",
+    "listen":           "whisper_stt",   # 0.8 M2b: plugin -> module
     "set_avatar_state": "animation",     # 0.8 M2c: was UNGATED entirely
     "play_timeline":    "animation",
     "warm_avatar":      "animation",
@@ -132,17 +136,6 @@ _TOOL_TO_MODULE: dict[str, str] = {
 # same fail-closed contract as :func:`_module_ready`.
 _TOOL_TO_SLOT: dict[str, str] = {
     "send_message": "messaging",
-    # 1.0.2: speech moved here from _TOOL_TO_MODULE, which pinned these
-    # to the engine names "kokoro_tts" / "whisper_stt". A slot can hold
-    # any module that claims it, so keying on the SLOT is what lets a
-    # different TTS or STT engine light these tools up without editing
-    # the agent. With kokoro/whisper installed the answer is identical;
-    # it differs only in the case the old mapping got wrong.
-    "text_to_speech": "tts",
-    "speak":          "tts",    # legacy alias for text_to_speech
-    "warm_tts":       "tts",
-    "warm_kokoro":    "tts",    # historical spelling
-    "listen":         "stt",
 }
 
 
@@ -238,14 +231,11 @@ def _slot_ready_for_tool(tool_name: str) -> bool | None:
     :data:`_TOOL_TO_SLOT`); ``None`` if it isn't, meaning the caller
     should fall back to the plugin mechanism. FINAL for slot-owned
     tools, mirroring :func:`_module_ready`."""
-    slot = _TOOL_TO_SLOT.get(tool_name)
-    if slot is None:
-        return None
     # A multimodal face owns its final-output TTS node. External speech tools
     # are deliberately hidden during that turn: the model selects a channel
     # in its typed final response, never with a tool call. Keep normal slot
     # availability everywhere else for explicit narration actions.
-    if slot == "tts" and tool_name in {"text_to_speech", "speak"}:
+    if tool_name in {"text_to_speech", "speak"}:
         try:
             from jaeger_agent.core.outputs import multimodal_output_active
 
@@ -253,7 +243,8 @@ def _slot_ready_for_tool(tool_name: str) -> bool | None:
                 return False
         except Exception:  # noqa: BLE001 — availability must never crash
             pass
-    return _slot_ready(slot)
+    slot = _TOOL_TO_SLOT.get(tool_name)
+    return _slot_ready(slot) if slot is not None else None
 
 
 def _plugin_ready(plugin_name: str) -> bool:

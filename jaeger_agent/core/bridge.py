@@ -21,7 +21,7 @@ from .messages import (
 _DEFAULT_MAX_QUEUE = 32
 _TRANSCRIPT_TOPIC = (
     getattr(topics, "SENSE_STT_TRANSCRIPT", None)
-    or getattr(topics, "SENSE_TRANSCRIPT")
+    or getattr(topics, "SENSE_STT_TRANSCRIPT")
 )
 
 
@@ -182,6 +182,7 @@ class AgentBridge:
                     reply = f"(turn failed: {self._last_error})"
                 finally:
                     self._turn_active.clear()
+                    self._events.current_session = ""
                 self._publish(ChatReply(text=reply, session=session))
                 self._publish_state("idle", session, self._context_detail(session))
         finally:

@@ -96,8 +96,10 @@ def classify_exception(exc: BaseException) -> str:
         k in name for k in (
             "timeout", "connection", "apiconnection", "serviceunavailable",
             "overloaded", "internalserver", "badgateway",
+            "chunkedencodingerror", "remoteprotocolerror", "incompleteread",
+            "streamerrored", "streamclosed",
         )
-    ):
+    ) or any(k in _message_of(exc) for k in ("stream disconnected", "chunk decode")):
         return TRANSIENT
     return UNKNOWN
 
@@ -150,7 +152,7 @@ def friendly_overflow_text(*,
                            system_prompt_tokens: int, tools_tokens: int,
                            latest_user_tokens: int) -> str:
     """Render the pre-flight :class:`ContextOverflow` from
-    :mod:`jaeger_os.agent.util.context_guard` as actionable advice.
+    :mod:`jaeger_agent.util.context_guard` as actionable advice.
 
     Parallel to :func:`friendly_error_text` (which catches the *reactive*
     side — the server's 400 after we sent too much) but fired *before*

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=83"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "jaeger-agent"
-description = "Reusable, headless agent runtime module for JaegerOS applications and robots."
+description = "Reusable agent runtime with model adapters, tools, skills, memory, automation, delegation, and headless operation."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dynamic = ["version"]
@@ -20,24 +20,11 @@ dependencies = [
     "jaeger-os>=0.9.0",
     "llama-cpp-python>=0.3",
     "jinja2>=3.1",
-    # Six core modules parse YAML at runtime — the skill registry (manifest
-    # v3, capability state, packaging), plugin manifests, and instance.py's
-    # identity/config readers. It was declared only under [dev] and arrived
-    # transitively via jaeger-os, which is not a guarantee for something the
-    # prompt-assembly path depends on.
-    "pyyaml>=6",
-    # schedule_prompt / list_schedules parse and advance cron expressions
-    # through it (memory.py). Undeclared until 1.0.8, which is how a bench
-    # run in an environment without it produced a real, reproducible
-    # failure: schedule_prompt errored, the agent correctly diagnosed a
-    # missing package and tried to install it, and the loop backstop
-    # halted the turn on the repeat.
-    "croniter>=2",
-    # web_search / web_extract are CORE tools (toolset_scoping), and every
-    # search backend past the ddgs chain reaches for requests. web.py's own
-    # comment called it "a hard dep — already on the jaeger extras list";
-    # it was on no list at all.
-    "requests>=2.31",
+    # Scheduling is a base capability, not a backend: memory.add_schedule
+    # and the due-claim sweep both import croniter unconditionally, so a
+    # bare `pip install jaeger-agent` that lacked it shipped a scheduler
+    # that raised ModuleNotFoundError on first use.
+    "croniter>=2.0",
 ]
 
 # Everything else is a REMOTE or alternative backend, and therefore
@@ -131,14 +118,16 @@ ocr_macos = ["pyobjc-framework-Vision>=10", "pyobjc-framework-Quartz>=10",
 search = ["ddgs>=6", "duckduckgo-search>=6"]  # ddgs is the current name; the legacy
                                           # package stays for the fallback backend
 
-dev = ["pytest>=8", "pytest-timeout>=2", "pyyaml>=6", "ruff>=0.4",
-       "numpy>=1.26", "scipy>=1.11", "onnxruntime>=1.17"]
+dev = ["pytest>=8", "pyyaml>=6", "ruff>=0.4"]
 
 [project.entry-points."jaeger_os.module_roots"]
 jaeger_agent = "jaeger_agent.core.module_roots:roots"
 
 [tool.setuptools.dynamic]
 version = {attr = "jaeger_agent.__version__"}
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["jaeger_agent*"]
@@ -147,44 +136,26 @@ include = ["jaeger_agent*"]
 exclude = ["jaeger_agent*.__pycache__", "jaeger_agent*.__pycache__.*"]
 
 [tool.setuptools.package-data]
-# "**/*" and not an extension allowlist. setuptools auto-includes only
-# .py for a found package, and this package is 528 non-.py files:
-# module.yaml, the prompt .md files, thinking_runner.yaml, every node.json plus
-# its weights/stats lineage, and — the big one — every SKILL.md under skills/,
-# which IS the 107-recipe corpus.
-#
-# The 0.11 move made this load-bearing. While the agent lived inside
-# JaegerAI it rode that project's `jaeger_ai = ["**/*"]`; the moment it
-# became its own distribution, `["module.yaml"]` meant a real
-# (non-editable) install shipped the loop and ZERO skills. Editable
-# installs read straight from the source tree and hide it completely,
-# so this only ever breaks for the people who pip-install a release.
-#
-# An allowlist would also silently miss whatever the next skill adds —
-# these already include .xsd, .sty, .tex, .bst and .sh.
+# Runtime data must ship in non-editable installs. Keep explicit resource
+# patterns so bytecode, databases, logs and build residue cannot enter a wheel.
+# Installed-package asset tests guard the prompts, skills, nodes and manifests.
 jaeger_agent = [
-    "**/*",
-    "nodes/*/node.json",
-    "nodes/*/weights/*",
-    "nodes/*/stats/*",
-]
-
-[tool.setuptools.exclude-package-data]
-# A release must be reproducible from a used working tree.  Local interpreter
-# caches are never runtime assets and must not leak into wheels or sdists.
-"*" = [
-    "**/__pycache__/*",
-    "**/*.pyc",
-    "**/*.pyo",
+    "skills/**/*.md", "skills/**/*.yaml", "skills/**/*.yml",
+    "skills/**/*.json", "skills/**/*.xsd", "skills/**/*.sty",
+    "skills/**/*.tex", "skills/**/*.bst", "skills/**/*.bib",
+    "skills/**/*.pdf", "skills/**/*.html", "skills/**/*.txt",
+    "skills/**/*.js", "skills/**/*.ini", "skills/**/*.sh",
+    "skills/**/LICENSE", "skills/**/Makefile",
+    "module.yaml", "prompts/**/*.md", "prompts/**/*.yaml", "background/*.yaml",
+    "nodes/*/node.json", "nodes/*/weights/*.md", "nodes/*/stats/*.md",
+    "assets/silero/*.onnx", "assets/silero/*.txt", "assets/silero/*.md",
 ]
 
 [tool.pytest.ini_options]
+cache_dir = "~/.cache/pytest"
 testpaths = ["tests"]
 
 [tool.ruff]
+cache-dir = "~/.cache/ruff/jaeger-agent"
 line-length = 100
 target-version = "py311"
-
-[tool.ruff.lint]
-# Keep the established Pyflakes/pycodestyle gate stable across Ruff updates.
-select = ["E4", "E7", "E9", "F"]

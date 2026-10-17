@@ -11,6 +11,7 @@ from .core.config import AgentConfig, MultimodalConfig
 from .core.contracts import AgentRuntime, RuntimeEvents, TurnResult
 from .adapters.anthropic import AnthropicAdapter
 from .adapters.base import KNOWN_FEATURES, ProviderAdapter
+from .adapters.cli_backend import CliBackendAdapter
 from .adapters.hermes_xml import HermesXMLAdapter
 from .adapters.local_llama import LocalLlamaAdapter
 from .adapters.mlx import MLXAdapter
@@ -31,6 +32,7 @@ from .core.messages import (
 from .core.node import MindNode, make_mind_node
 from .parsing import schema_sanitizer
 from .schemas.message_types import Message, Role, ToolCall
+from .tool_executor import DirectToolExecutor, LedgerToolExecutor, ToolExecutor
 from .util.retry_utils import jittered_backoff, retry_with_backoff
 from jaeger_os.core.tools.arg_coercion import coerce_args
 from jaeger_os.core.tools.tool_registry import (
@@ -66,7 +68,7 @@ _LAZY = {
     "resolve_toolsets": ("jaeger_agent.schemas.tool_bundles", "resolve_toolsets"),
     "toolset_for_tool": ("jaeger_agent.schemas.tool_bundles", "toolset_for_tool"),
     "tool_visible":     ("jaeger_agent.skill_registry.toolset_scoping", "tool_visible"),
-    "build_system_prompt": ("jaeger_agent.prompts.prompts", "build_system_prompt"),
+    "build_system_prompt": ("jaeger_agent.prompts.assemble", "build_system_prompt"),
 }
 
 
@@ -103,8 +105,11 @@ __all__ = [
     "AgentRuntime",
     "AgentState",
     "AnthropicAdapter",
+    "CliBackendAdapter",
     "ChatMessage",
     "ChatReply",
+    "DirectToolExecutor",
+    "LedgerToolExecutor",
     "Event",
     "GemmaMultimodal",
     "HermesXMLAdapter",
@@ -126,6 +131,7 @@ __all__ = [
     "ToolEvent",
     "ToolCall",
     "ToolDef",
+    "ToolExecutor",
     "TurnResult",
     "clear_registry",
     "coerce_args",

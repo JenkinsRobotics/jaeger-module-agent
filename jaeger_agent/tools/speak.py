@@ -1,7 +1,7 @@
 """Text-to-speech tool shims — route through the 0.4 TTS node.
 
   • speak(text=, path=) — publish /act/speech, wait for /sense/spoken
-  • warm_tts()          — pre-load whatever fills the ``tts`` slot
+  • warm_kokoro()       — pre-load the Kokoro pipeline at startup
 
 0.4 rewire (Track B.2): the tool used to call ``KokoroTTS.speak()``
 directly in-process.  It now publishes a :class:`SpeechCommand` on
@@ -10,8 +10,7 @@ the brain's bus and blocks until the TTS node returns a
 
 The agent's tool surface is unchanged — same function name, same
 arguments, same return-dict shape.  What changed is who actually
-runs the synthesis: the ``tts`` slot's node owns the engine, not this
-module. 1.0.2 finished the job — no engine is named here any more.
+runs the synthesis: the TTS node owns Kokoro now, not this module.
 That preserves the operator's lock-in: "**a tool does the
 networking, the node does the execution**."
 
@@ -28,13 +27,27 @@ from typing import Any
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 from jaeger_agent.core.workspace import SandboxError, _require_layout, _resolve_under
 
-# Voice resolution (identity.yaml -> active character -> module
-# default) is pure instance-config logic with no tool-calling concern,
-# so it lives in core.voice — nodes/runtime.py (runtime tier) needs the
-# same resolution to build the engine at node-boot time and must never
-# import agent/ (nervous-system rule). Aliased to the historical name
-# since this module's own callers below still say ``_resolve_voice()``.
-from jaeger_os.core.voice.voice_resolution import resolve_voice as _resolve_voice
+# Re-export the module's constants so existing imports keep working.
+try:
+    from ...nodes.kokoro_tts import (
+        KOKORO_LANG,
+        KOKORO_SAMPLE_RATE as KOKORO_SAMPLE_RATE,
+        KOKORO_VOICE as KOKORO_VOICE,
+        KokoroTTS,
+    )
+except ImportError:
+    # 0.8 M2a: kokoro_tts module removed from this deployment. These
+    # constants are only ever read while actually synthesizing speech
+    # (``_get_tts``'s fallback branch, ``core.voice.voice_resolution``'s
+    # except branch) — paths the ``_speak_via_bus`` early-return below
+    # keeps the agent from ever reaching when the module's gone.
+    # Fallbacks mirror kokoro_tts/engine.py's own defaults so nothing
+    # downstream sees a surprising type.
+    KOKORO_LANG = "a"
+    KOKORO_SAMPLE_RATE = 24000
+    KOKORO_VOICE = "af_heart"
+    KokoroTTS = None  # type: ignore[assignment,misc]
+
 
 # How long the brain's tool waits for the TTS node to publish
 # /sense/spoken.  Long enough for a multi-minute narration; short
@@ -43,33 +56,18 @@ from jaeger_os.core.voice.voice_resolution import resolve_voice as _resolve_voic
 _SPEAK_TIMEOUT_S = 180.0
 
 
-
-# Defaults used when a caller needs a rate or language before the node
-# has spoken. Engine-NEUTRAL on purpose: 1.0.2 removed a
-# ``from ...nodes.kokoro_tts import`` here that pointed at the pre-0.8
-# in-tree layout and had therefore been failing into this fallback on
-# every import since the module became its own package. The values are
-# the common case for 24 kHz neural TTS; the live node reports its own.
-TTS_DEFAULT_LANG = "a"
-TTS_DEFAULT_SAMPLE_RATE = 24000
-TTS_DEFAULT_VOICE = "af_heart"
-
-# Historical aliases. Nothing outside this package imported them, but
-# they were in ``tools/__init__``'s ``__all__``, so they are kept one
-# release rather than removed silently.
-KOKORO_LANG = TTS_DEFAULT_LANG
-KOKORO_SAMPLE_RATE = TTS_DEFAULT_SAMPLE_RATE
-KOKORO_VOICE = TTS_DEFAULT_VOICE
+# Voice resolution (identity.yaml -> active character -> module
+# default) is pure instance-config logic with no tool-calling concern,
+# so it lives in core.voice — nodes/runtime.py (runtime tier) needs the
+# same resolution to build Kokoro at node-boot time and must never
+# import agent/ (nervous-system rule). Aliased to the historical name
+# since this module's own callers below still say ``_resolve_voice()``.
+from jaeger_os.core.voice.voice_resolution import resolve_voice as _resolve_voice
 
 
-def warm_tts() -> dict[str, Any]:
-    """Pre-load whatever fills the ``tts`` slot so the first ``speak()``
-    doesn't pay the weight-load tax.  Idempotent.
-
-    Prefer letting the module warm ITSELF — ``[config.tts] warm = true``
-    in the app manifest. An application that wants boot-time warming
-    should not have to ask the mind to arrange it. This stays for hosts
-    whose boot path starts the node lazily.
+def warm_kokoro() -> dict[str, Any]:
+    """Pre-load Kokoro so the first ``speak()`` doesn't pay the
+    ~5-7 s weight-load tax.  Idempotent.
 
     0.4 (Track B.2): also boots the TTS node + bus runtime so the
     first ``speak()`` call doesn't pay the node-spinup tax either."""
@@ -78,34 +76,33 @@ def warm_tts() -> dict[str, Any]:
     synth = runtime.get_synth()
     if synth is None:
         return {"warmed": False, "reason": "tts runtime not initialized"}
-    # The synth's own warm report (the dict the pre-0.4 caller got
-    # back). warm() is idempotent — a second call returns cached state.
+    # Return Kokoro's own warm report (the dict the pre-0.4 caller
+    # got back).  warm() is idempotent — second call returns the
+    # cached state.
     return synth.warm()
 
 
-#: Historical alias — the engine-named spelling this had until 1.0.2.
-warm_kokoro = warm_tts
+def _get_tts() -> KokoroTTS:
+    """Back-compat accessor for backend setup around the TTS node.
 
-
-def _get_tts() -> Any:
-    """The live ``Synthesizer`` the ``tts`` node wraps.
-
-    NON-EXECUTION configuration only — echo-cancellation reference
-    buffer, audio backend selection, warm reporting. Speech itself is
-    bus-routed through :func:`speak`.
-
-    1.0.2 removed a "fallback" here that constructed the engine directly
-    when the runtime had no synth. It could not have worked: the class it
-    named had been ``None`` since the engine moved to its own package, so
-    the branch written to avoid a crash WAS the crash. Returning ``None``
-    lets a caller check, which is what they all already do.
+    The speech execution path is bus-routed now.  A few voice
+    coordinators still need the wrapped KokoroTTS instance for
+    non-execution configuration such as AEC reference-buffer wiring,
+    audio backend selection, and warm status reporting.
     """
     from jaeger_os.nodes import runtime
     runtime.ensure_tts_node()
-    return runtime.get_synth()
+    synth = runtime.get_synth()
+    if synth is None:
+        # Fallback path: construct directly.  Shouldn't happen since
+        # ensure_tts_node() above always materialises a synth, but
+        # if some startup ordering surprise leaves runtime empty we
+        # still want a working KokoroTTS instead of crashing.
+        return KokoroTTS(voice=_resolve_voice(), lang=KOKORO_LANG)
+    return synth
 
 
-def speak(text: str = "", path: str = "") -> dict[str, Any]:
+def speak(text: str = "", path: str = "", voice: str = "") -> dict[str, Any]:
     """Speak aloud through the default audio output via the TTS node.
 
     Pass ``text`` to speak literal text, or ``path`` to narrate a
@@ -154,14 +151,14 @@ def speak(text: str = "", path: str = "") -> dict[str, Any]:
             return {"spoken": False, "reason": "file not found",
                     "path": file_path}
         body = target.read_text(encoding="utf-8")
-        result = _speak_via_bus(body)
+        result = _speak_via_bus(body, voice)
         result["from_file"] = str(target.relative_to(layout.root))
         return result
 
     if not (text or "").strip():
         return {"spoken": False,
                 "reason": "nothing to speak — pass text or path"}
-    return _speak_via_bus(text)
+    return _speak_via_bus(text, voice)
 
 
 def _tts_module_present() -> bool:
@@ -177,11 +174,12 @@ def _tts_module_present() -> bool:
     an unrelated reason, so a broken availability module doesn't turn
     into a false "module missing"."""
     try:
-        from jaeger_agent.core.availability import _slot_ready_for_tool
+        from jaeger_agent.core.availability import _slot_ready, _slot_ready_for_tool
 
         ready = _slot_ready_for_tool("text_to_speech")
         if ready is not None:
             return ready
+        return _slot_ready("tts")
     except Exception:  # noqa: BLE001 — gate import must never block speak
         pass
     try:
@@ -191,7 +189,7 @@ def _tts_module_present() -> bool:
         return True  # fail-open: don't block speak because discovery broke
 
 
-def _speak_via_bus(text: str) -> dict[str, Any]:
+def _speak_via_bus(text: str, voice: str = "") -> dict[str, Any]:
     """Publish a :class:`SpeechCommand` and block on the matching
     :class:`SpokenAck`.  Returns a dict shaped like the pre-0.4
     in-process result for backward-compatible callers."""
@@ -203,7 +201,7 @@ def _speak_via_bus(text: str) -> dict[str, Any]:
 
     # 0.8.1 field bug #2: boot's voice warm now runs in the background
     # (main.py's warm_plugins_async). A speak() landing before it
-    # finishes still works — the engine's own pipeline lock makes this call
+    # finishes still works — KokoroTTS._pipeline_lock makes this call
     # wait for the in-flight load instead of racing it — but say so
     # loudly instead of silently pausing for several seconds.
     try:
@@ -217,7 +215,7 @@ def _speak_via_bus(text: str) -> dict[str, Any]:
         pass
 
     # Ensure the node + bus are up.  Idempotent — pays the spinup
-    # cost only on the very first call (which warm_tts should
+    # cost only on the very first call (which warm_kokoro should
     # have already covered at boot).
     runtime.ensure_tts_node()
     bus = runtime.get_bus()
@@ -225,13 +223,18 @@ def _speak_via_bus(text: str) -> dict[str, Any]:
     cid = uuid.uuid4().hex
     request = topics.SpeechCommand(
         text=text,
-        voice=_resolve_voice(),
+        # An explicit ``voice`` overrides the active character's configured
+        # one for THIS utterance only. OS 1's State 3 uses it to speak the
+        # handoff in the pack matching the operator's voice_profile, before
+        # any character is bound. Empty (the default) keeps the historical
+        # behaviour: resolve from the active character.
+        voice=voice.strip() or _resolve_voice(),
         node_id="brain",
         correlation_id=cid,
     )
     ack = bus.request(
         request,
-        ack_topic=topics.SENSE_SPOKEN,
+        ack_topic=topics.ACT_SPEECH_SPOKEN,
         timeout_s=_SPEAK_TIMEOUT_S,
     )
     if ack is None:

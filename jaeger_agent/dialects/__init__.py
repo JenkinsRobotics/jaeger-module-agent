@@ -31,7 +31,7 @@ from jaeger_agent.schemas.message_types import ToolCall
 
 from . import chatml, gemma, harmony, llama3, mistral
 from ._shared import new_id, normalize_tool_name, repair_arguments
-from .detect import FAMILIES, detect_family, detect_reasoning, strip_think_blocks
+from .detect import (FAMILIES, detect_family, detect_reasoning, extract_think_blocks, strip_think_blocks)
 from .gemma import strip_reasoning_channels
 
 
@@ -46,9 +46,18 @@ _NON_LLAMA_WRAPPERS = ("<tool_call>", "<|tool_call|>", "<|tool_call>", "<functio
 
 
 def _wrap(calls: list[dict[str, Any]], prefix: str) -> list[ToolCall]:
+    """Tag extracted calls with a synthetic id, dropping any with no name.
+
+    A call whose name did not survive parsing is not a call — a model emitting
+    ``<tool_call>{"arguments": {...}}</tool_call>`` has told us nothing about
+    what to run. Dropped here rather than in each dialect because every
+    extractor funnels through this one function, and because a nameless call
+    passed downstream fails later with a far less obvious message.
+    """
     return [
-        {"id": new_id(prefix), "name": c["name"], "arguments": c["args"]}
+        {"id": new_id(prefix), "name": name, "arguments": c["args"]}
         for c in calls
+        if (name := str(c.get("name") or "").strip())
     ]
 
 
@@ -257,6 +266,7 @@ __all__ = [
     "detect_family",
     "detect_reasoning",
     "strip_think_blocks",
+    "extract_think_blocks",
     "strip_reasoning_channels",
     "FAMILIES",
 ]

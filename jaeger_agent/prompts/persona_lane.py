@@ -1,11 +1,8 @@
 """Persona Mode C — the id and the ego.
 
-Shipped mechanism: docs/ARCHITECTURE.md section 6. The design that
-produced this mode (A/B/C compared, build plan) stayed in JaegerAI at
-dev/docs/roadmap/PERSONA_PIPELINE_ABC_DESIGN.md and
-PERSONA_MODE_C_BUILD_PLAN.md — an application is where a thing is
-designed; only what locked in came here. Operator-canonized framing,
-2026-07-10:
+Design: dev/docs/roadmap/PERSONA_PIPELINE_ABC_DESIGN.md (Mode C section);
+build plan: dev/docs/roadmap/PERSONA_MODE_C_BUILD_PLAN.md. Operator-
+canonized framing, 2026-07-10:
 
 The persona lane IS the id — desire, voice, character. It wants to answer
 everything itself, in character, right now. The clean agent (driven here
@@ -23,7 +20,7 @@ decides — call ``perform_task`` (the full clean agentic loop: persona-off,
 every tool, the hardened prompt) or answer as the character. Delegation is
 a TOOL CALL, not a prose classifier — the same decision shape the routing
 bench measures. The decision is driven the same way the main loop drives
-every other text-dialect family (:mod:`jaeger_os.agent.dialects.chatml`):
+every other text-dialect family (:mod:`jaeger_agent.dialects.chatml`):
 the tool schema is spelled out in the system prompt and the FIRST aux call
 is plain chat with no structured ``tools=`` kwarg, because the aux lane's
 raw ``client.chat()`` (main.py's ``LlamaCppPythonClient.chat`` — a
@@ -207,11 +204,11 @@ LANE_CONTRACT = (
 
 # The tool catalogue itself, rendered in the SAME text dialect the main
 # loop uses for every text-driven family (chatml/Hermes — see
-# jaeger_os.agent.dialects.chatml and adapters/local_llama.py's
+# jaeger_agent.dialects.chatml and adapters/local_llama.py's
 # format_messages). Reused verbatim rather than reinvented: this is the
 # one tool-presentation renderer proven across the bench, and
 # extract_tool_calls already parses its ``<tool_call>{...}</tool_call>``
-# envelope through jaeger_os.agent.dialects.chatml.extract_envelope
+# envelope through jaeger_agent.dialects.chatml.extract_envelope
 # regardless of which family emitted it.
 LANE_TOOLS_BLOCK = _render_chatml_tools([PERFORM_TASK_SPEC])
 
@@ -280,7 +277,7 @@ MAX_HISTORY_CHARS = 3200
 #     (0.8 M2a's graceful-removal design gates it via check_fn instead
 #     of unregistering it), so the tool registry alone would claim a
 #     capability that isn't actually there.
-#   * jaeger_os.agent.skill_registry.toolset_scoping.TOOLSETS — the
+#   * jaeger_agent.skill_registry.toolset_scoping.TOOLSETS — the
 #     routing surface's own category->tool-name map, intersected with
 #     jaeger_os.core.tools.tool_registry.get_tools() (the live,
 #     process-wide registry) — for the core, always-compiled-in
@@ -297,7 +294,7 @@ MAX_HISTORY_CHARS = 3200
 # perform_task as the one real callable, or the id treats a label as a
 # tool name and the call dies unparsed.
 _SELF_MODEL_HEADER = (
-    "You are a JROS agent running locally on this machine. Capability "
+    "You are a Jaeger agent running locally on this machine. Capability "
     "areas below are NOT tool names — you reach ALL of them through "
     "your one tool, perform_task:"
 )

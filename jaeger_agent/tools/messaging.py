@@ -11,12 +11,14 @@ every other tool. Registered on import (see ``_register_builtins``).
 
 from __future__ import annotations
 
+from typing import Any
+
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 from jaeger_agent.core.workspace import get_current_session, get_layout
 from jaeger_os.core.safety.permissions import PermissionTier, requires_tier
 
 
-@register_tool_from_function
+@register_tool_from_function(side_effect="external")
 @requires_tier(PermissionTier.EXTERNAL_EFFECT, skill="messaging",
                operation="send_message",
                summary="send a message on an external channel")

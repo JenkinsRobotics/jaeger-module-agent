@@ -39,6 +39,7 @@ from .config import AgentConfig
 from .contracts import TurnResult
 from ..loop.callbacks import AgentCallbacks
 from ..loop.jaeger_agent import JaegerAgent
+from ..loop.turn_budget import TurnBudgetLimits
 
 
 #: Conventional environment variable per provider, used when the config
@@ -47,6 +48,10 @@ _DEFAULT_KEY_ENV = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "groq": "GROQ_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "vllm": "VLLM_API_KEY",
 }
 
 #: Providers that load weights from disk rather than dialling an
@@ -139,6 +144,14 @@ def build_adapter(cfg: AgentConfig) -> Any:
             temperature=cfg.temperature,
         )
 
+    if provider == "cli":
+        from .adapters.cli_backend import CliBackendAdapter
+
+        return CliBackendAdapter(
+            backend_id=cfg.model or "claude",
+            timeout_s=cfg.timeout_s,
+        )
+
     if provider == "anthropic":
         if not api_key:
             raise RuntimeError(
@@ -199,9 +212,8 @@ class DefaultAgentRuntime:
         # lazily inside _require_layout keeps directory creation out of
         # read-only status probes, and keeps it to one predictable place.
         #
-        # Lands at <cwd>/.jaeger_agent: with the project, never in the
-        # home directory or a temp dir. An application that binds its own
-        # instance first keeps it — ensure_bound is idempotent.
+        # Defaults to the external operator state root (~/.jaeger/agent).
+        # A host that binds its own instance keeps it; ensure_bound is idempotent.
         from .workspace import ensure_bound
 
         workspace = ensure_bound()
@@ -292,6 +304,12 @@ class DefaultAgentRuntime:
                 # without changing global registration or the agentic default.
                 tools=None if self.config.tools_enabled else [],
                 max_iterations=self.config.max_iterations,
+                turn_budget_limits=TurnBudgetLimits(
+                    max_iterations=self.config.max_iterations,
+                    max_elapsed_s=self.config.turn_max_elapsed_s or None,
+                    max_tokens=self.config.turn_max_tokens or None,
+                    max_tool_cost=self.config.turn_max_tool_cost or None,
+                ),
                 callbacks=self._callbacks(),
             )
             self._sessions[session_key] = agent
@@ -325,9 +343,27 @@ class DefaultAgentRuntime:
         if self._closed:
             return TurnResult(error="runtime is closed")
         try:
-            return TurnResult(text=self.agent_for(session_key).run_turn(text))
+            return TurnResult(text=self._run_bound_turn(session_key, text))
         except Exception as exc:  # noqa: BLE001 — one bad turn must not kill the node
             return TurnResult(error=f"{type(exc).__name__}: {exc}")
+
+    def _run_bound_turn(self, session_key: str, text: str, *, content: Any = None) -> str:
+        agent = self.agent_for(session_key)
+        from jaeger_agent.memory import sqlite_store
+        options = {"content": content} if content is not None else {}
+        if not sqlite_store.is_bound():
+            return agent.run_turn(text, **options)
+        from jaeger_agent.cognition.executive import TurnExecutive
+        from jaeger_agent.cognition.sqlite_commitments import SqliteCommitmentStore
+        from jaeger_agent.cognition.sqlite_runs import SqliteRunStore
+        from jaeger_agent.memory.sqlite_knowledge import SqliteKnowledgeStore
+        from jaeger_agent.cognition.world import WorldEvent
+        return TurnExecutive(
+            agent, SqliteRunStore(), SqliteCommitmentStore(),
+            provider=getattr(self.adapter, "name", None),
+            claims=SqliteKnowledgeStore(),
+            world_event=WorldEvent.for_session(text, session_key),
+        ).run_turn(text, **options)
 
     def run_multimodal_turn(
         self,
@@ -347,7 +383,7 @@ class DefaultAgentRuntime:
             return TurnResult(error="runtime is closed")
         try:
             agent = self.agent_for(session_key, system_prompt=system_prompt)
-            return TurnResult(text=agent.run_turn(text, content=content))
+            return TurnResult(text=self._run_bound_turn(session_key, text, content=content))
         except Exception as exc:  # noqa: BLE001 — match run_turn's boundary
             return TurnResult(error=f"{type(exc).__name__}: {exc}")
 
@@ -357,8 +393,12 @@ class DefaultAgentRuntime:
         if agent is not None:
             agent.interrupt()
 
-    def steer(self, text: str) -> bool:
-        """Mid-turn redirect. Only a session actually running can take one."""
+    def steer(self, text: str, *, session_key: str | None = None) -> bool:
+        """Mid-turn redirect. Targets session_key if specified; otherwise all active sessions."""
+        if session_key is not None and session_key in self._sessions:
+            return self._sessions[session_key].steer(text)
+        if session_key is not None:
+            return False
         return any(agent.steer(text) for agent in self._sessions.values())
 
     def interrupt(self, *, session_key: str) -> None:

@@ -1,6 +1,6 @@
 ---
 name: debugging-hermes-tui-commands
-description: "Debug Hermes TUI slash commands: Python, gateway, Ink UI."
+description: "Debug Hermes TUI slash commands: Python, gateway, Ink UI. Use when the user explicitly requests this named workflow or its specific output."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -137,7 +137,7 @@ After fixing:
 
 1. Rebuild the TUI:
    ```bash
-   cd /home/bb/hermes-agent && npm --prefix ui-tui run build
+   cd <repository-root> && npm --prefix ui-tui run build
    ```
 
 2. Run the TUI and test the command:
