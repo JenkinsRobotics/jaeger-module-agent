@@ -20,6 +20,7 @@ when sharing one across adapters / instances).
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -541,7 +542,9 @@ class LocalLlamaAdapter(OpenAIAdapter):
         if not (self.inject_tools_prose and tools):
             return self._apply_thinking_toggle(kwargs)
         family = self._resolve_tool_family()
-        cache_key = (family, tuple(t.name for t in tools))
+        # Names alone are insufficient: a host can update an action enum or
+        # description while keeping the same tool name between turns.
+        cache_key = (family, json.dumps(kwargs.get("tools", []), sort_keys=True))
         addition = self._tools_prose_cache.get(cache_key)
         if addition is None:
             if len(self._tools_prose_cache) > 8:
