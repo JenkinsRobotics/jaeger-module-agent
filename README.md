@@ -75,7 +75,7 @@ device; that connection uses the JaegerOS bus, topics, tools, and capabilities.
 ## Install for development
 
 ```bash
-git clone https://github.com/JenkinsRobotics/jaeger-agent.git
+git clone https://github.com/JenkinsRobotics/jaeger-module-agent.git
 cd jaeger-agent
 python3 -m venv .venv
 source .venv/bin/activate
