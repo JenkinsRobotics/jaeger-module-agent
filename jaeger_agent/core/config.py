@@ -133,12 +133,15 @@ class AgentConfig(BaseModel):
     # which in turn match JaegerAI's LlamaCppPythonClient — so a robot
     # embedding this module and the application it came from load the
     # same weights the same way, and benchmarks stay comparable.
+    # The exception is ctx: tools are on by default and the built-in
+    # tool list alone is ~15,000 tokens, so 8192 could not start a turn.
     ctx: int = Field(
-        8192, ge=512, le=1_000_000,
+        32768, ge=512, le=1_000_000,
         json_schema_extra=_setting("agent", advanced=True),
         description=(
-            "Context window to allocate, in tokens. Bigger costs RAM at "
-            "load time whether or not a turn ever fills it."
+            "Context window to allocate, in tokens. The default holds the "
+            "full built-in tool list with room for a conversation. Bigger "
+            "costs RAM at load time whether or not a turn ever fills it."
         ),
     )
     gpu_layers: int = Field(
@@ -178,10 +181,36 @@ class MultimodalConfig(BaseModel):
             "typed turns text-only."
         ),
     )
+    wake_required: bool = Field(
+        True,
+        json_schema_extra=_setting("multimodal"),
+        description=(
+            "Whether speech has to start with the wake phrase to be answered. "
+            "Turn it off where the app decides who is being addressed, such "
+            "as a microphone button on a character's own page."
+        ),
+    )
+    input_device: int | str | None = Field(
+        None,
+        json_schema_extra=_setting("multimodal"),
+        description=(
+            "Sound card to listen on wherever the agent opens a microphone "
+            "itself (index or name; empty = system default). An app that "
+            "feeds push_audio decides the source itself."
+        ),
+    )
+    output_device: int | str | None = Field(
+        None,
+        json_schema_extra=_setting("multimodal"),
+        description=(
+            "Sound card the voice plays on when the app gives no outputs of "
+            "its own (index or name; empty = system default)."
+        ),
+    )
     stt_model: str = Field(
         "large-v3-turbo",
         json_schema_extra=_setting("multimodal"),
-        description="pywhispercpp model name or cache-resolvable model path.",
+        description="Hearing model name, passed to the module that fills the stt slot.",
     )
     silero_model_path: str = Field(
         default_factory=lambda: str(DEFAULT_SILERO_MODEL),

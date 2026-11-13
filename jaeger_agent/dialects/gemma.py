@@ -5,12 +5,13 @@ llama-cpp's function-calling handler, so injecting system-prompt prose
 would be redundant and risks perturbing a model that already routes
 well. :func:`render_tools` returns ``""`` by construction.
 
-Parsing: Gemma emits tool calls in three native shapes, all salvaged
+Parsing: Gemma emits tool calls in these shapes, all salvaged
 here (the model only ever speaks one, but builds vary):
 
   * brace args:  ``<|tool_call>call:name{"k": "v"}<tool_call|>``
   * paren kwargs: ``<|tool_call>call:name(key='value', n=3)<tool_call|>``
   * legacy JSON envelope: ``<|tool_call|>{"name": …}<|/tool_call|>``
+  * bare call (malformed): ``<call:name{"k": "v"}>``
 
 Tool names allow ``:`` and ``/`` so MCP-qualified names like
 ``mcp:web/fetch`` salvage.
@@ -18,6 +19,7 @@ Tool names allow ``:`` and ``/`` so MCP-qualified names like
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -40,6 +42,9 @@ NATIVE_PATTERNS = [
     ),
     # <|tool_call|>…<|/tool_call|>   (legacy JSON envelope)
     re.compile(r"<\|tool_call\|>\s*(.*?)\s*<\|/tool_call\|>", re.DOTALL),
+    # <call:name{...}> or <call:name{...}/>  (no opener, bare close — seen
+    # 2026-11-11 from gemma-4 under a persona, in the middle of its words)
+    re.compile(r"<call:\s*([a-zA-Z_][\w:/.\-]*)\s*\{(.*?)\}\s*/?>", re.DOTALL),
 ]
 
 
@@ -106,6 +111,16 @@ def render_tools(tools: list[Any]) -> str:
     """Gemma needs no prose injection — its structured ``tools=`` path
     works. Always returns ``""``."""
     return ""
+
+
+def render_tool_call(name: str, args: dict[str, Any]) -> str:
+    """One call as Gemma 4 itself writes it — for showing the model an
+    example. Not a history renderer: Gemma's history stays structured."""
+    q = '<|"|>'
+    body = ",".join(
+        f"{k}:{q}{v}{q}" if isinstance(v, str) else f"{k}:{json.dumps(v)}"
+        for k, v in args.items())
+    return f"<|tool_call>call:{name}{{{body}}}<tool_call|>"
 
 
 # Gemma 4's reasoning/channel markers, rendered as raw text by llama.cpp

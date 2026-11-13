@@ -70,7 +70,7 @@ class AudioIO:
     _AGC_TARGET = 0.06
     _AGC_MAX = 12.0
 
-    def __init__(self) -> None:
+    def __init__(self, input_device=None, output_device=None) -> None:
         if pyaec is None:
             raise RuntimeError(
                 "pyaec is required for quasi/full audio_mode; "
@@ -110,6 +110,7 @@ class AudioIO:
             samplerate=STREAM_SR, channels=(1, 1), dtype="int16",
             blocksize=AEC_FRAME_SAMPLES * _DEC, callback=self._cb,
             latency=("low", "low"),
+            device=(input_device, output_device),    # None = system default
         )
 
     def _cb(self, indata, outdata, frames, _time_info, status) -> None:
@@ -159,9 +160,9 @@ class AudioIO:
             self.q.put(f32 * _agc_gain(self._agc_peak, self._agc_noise,
                                        self._AGC_TARGET, self._AGC_MAX))
 
-    def play_chunk(self, chunk_f32_24k: np.ndarray) -> None:
-        """Native-quality path: Kokoro's 24 k floats upsample x2 to the 48 k
-        device — nothing above 8 kHz is discarded anymore."""
+    def play_chunk(self, chunk_f32: np.ndarray, rate: int = TTS_NATIVE_SR) -> None:
+        """Native-quality path: the voice's floats (Kokoro: 24 k, x2) go up
+        to the 48 k device — nothing above 8 kHz is discarded anymore."""
         try:
             from scipy.signal import resample_poly
         except ImportError as exc:
@@ -169,8 +170,8 @@ class AudioIO:
                 "scipy is required for duplex playback; "
                 "install jaeger-agent[multimodal]"
             ) from exc
-        up = resample_poly(np.asarray(chunk_f32_24k, dtype=np.float32),
-                           up=STREAM_SR, down=TTS_NATIVE_SR)
+        up = resample_poly(np.asarray(chunk_f32, dtype=np.float32),
+                           up=STREAM_SR, down=rate)
         self._play_q.put(np.clip(up * 32767.0, -32768,
                                  32767).astype(np.int16))
 

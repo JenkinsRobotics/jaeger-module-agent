@@ -447,7 +447,6 @@ def test_public_session_controls_keep_floor_policy_in_the_engine() -> None:
     engine = GemmaMultimodal(play=False, runtime=runtime, audio_mode="structured")
     states = []
     engine.on_event = lambda event: states.append((event.kind, event.text, event.data))
-    assert engine._stt_lock is engine.node_stt._lock
 
     engine.set_barge_mode("continue")
     assert engine_module.dxr.BARGE_MODE == "continue"

@@ -1,40 +1,36 @@
-"""STT node: Whisper large-v3-turbo, whole-utterance authoritative decode.
+"""Hearing node: hears through whichever Jaeger module fills the ``stt`` slot.
 
-Node of the agent brain. Config source of truth stays core/policy.py;
-the manifest documents it."""
+No loader lives here.  Today the slot is filled by jaeger-whisper-stt (Metal
+on Apple Silicon, CUDA or CPU elsewhere); replacing the module replaces it.
+"""
 from __future__ import annotations
-
-import threading
 
 import numpy as np
 
-try:  # packaged engine
-    from jaeger_agent.core.policy import SAMPLE_RATE, STT_MODEL
-except ImportError:  # portable node folder loaded by the playground
-    from policy import SAMPLE_RATE, STT_MODEL
+from jaeger_agent.core.parts import HEARING_LOCK, open_part
+from jaeger_agent.core.policy import STT_MODEL
 
 
 class SttWhisper:
     def __init__(self) -> None:
-        self.model = None
-        self._lock = threading.Lock()   # preview and final share one model
+        self.model = None                   # the module's hearing object
+        self._lock = HEARING_LOCK           # every pass in the process, one at a time
+        self.info: dict[str, str] = {}      # module, version, model, compute
 
     def load(self, say=print, *, model_name: str = STT_MODEL) -> None:
-        from pywhispercpp.model import Model
-        say(f"loading Whisper {model_name}…")
-        self.model = Model(model_name, print_realtime=False,
-                           print_progress=False)
-        try:
-            self.model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32),
-                                  language="en")
-        except Exception:
-            pass
+        say(f"loading hearing {model_name}…")
+        self.model, info = open_part("stt", "open_hearing", shared=True,
+                                     model=model_name)
+        self.info = {**info, "model": model_name}
 
-    def transcribe(self, audio) -> str:
+    def transcribe(self, audio, abort=None) -> str:
+        """Words in ``audio``. ``abort()`` turning true stops a pass nobody needs."""
         with self._lock:
+            if abort is not None and abort():
+                return ""
             return " ".join(s.text for s in self.model.transcribe(
-                np.asarray(audio, dtype=np.float32).reshape(-1),
-                language="en")).strip()
+                np.asarray(audio, dtype=np.float32).reshape(-1), language="en",
+                abort=abort)).strip()
 
 
 def build():

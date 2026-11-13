@@ -321,11 +321,19 @@ class DefaultAgentRuntime:
 
     # ── AgentRuntime protocol ────────────────────────────────────────
 
-    def run_turn(self, text: str, *, session_key: str = "default") -> TurnResult:
+    def run_turn(
+        self, text: str, *, session_key: str = "default", on_delta: Any = None,
+    ) -> TurnResult:
+        """Run one turn. ``on_delta`` gets the reply's text as it is written."""
         if self._closed:
             return TurnResult(error="runtime is closed")
         try:
-            return TurnResult(text=self.agent_for(session_key).run_turn(text))
+            agent = self.agent_for(session_key)
+            agent.callbacks.stream_delta = on_delta
+            try:
+                return TurnResult(text=agent.run_turn(text))
+            finally:
+                agent.callbacks.stream_delta = None
         except Exception as exc:  # noqa: BLE001 — one bad turn must not kill the node
             return TurnResult(error=f"{type(exc).__name__}: {exc}")
 
@@ -336,6 +344,7 @@ class DefaultAgentRuntime:
         text: str,
         system_prompt: str = "",
         session_key: str = "default",
+        on_delta: Any = None,
     ) -> TurnResult:
         """Run image+text or structured-text content through the same agent.
 
@@ -347,9 +356,21 @@ class DefaultAgentRuntime:
             return TurnResult(error="runtime is closed")
         try:
             agent = self.agent_for(session_key, system_prompt=system_prompt)
-            return TurnResult(text=agent.run_turn(text, content=content))
+            agent.callbacks.stream_delta = on_delta
+            try:
+                return TurnResult(text=agent.run_turn(text, content=content))
+            finally:
+                agent.callbacks.stream_delta = None
         except Exception as exc:  # noqa: BLE001 — match run_turn's boundary
             return TurnResult(error=f"{type(exc).__name__}: {exc}")
+
+    def note(self, session_key: str, user_text: str, reply: str) -> None:
+        """Put one exchange that no turn produced (a performed scene) into an
+        open conversation, as a user line and the reply to it."""
+        agent = self._sessions.get(session_key)
+        if agent is not None:
+            agent.messages += [{"role": "user", "content": user_text},
+                               {"role": "assistant", "content": reply}]
 
     def clear_session(self, session_key: str) -> None:
         """Discard one conversation without closing the shared runtime."""

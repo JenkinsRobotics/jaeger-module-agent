@@ -11,6 +11,10 @@ def main(argv: list[str] | None = None) -> int:
         from .core.selfcheck import main as selfcheck_main
 
         return selfcheck_main(args[1:])
+    if args and args[0] == "speechbench":
+        from .bench import speech
+
+        return speech.main(args[1:])
     if args and args[0] == "multimodal":
         args = args[1:]
     from .core.runner import main as multimodal_main

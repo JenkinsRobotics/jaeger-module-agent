@@ -561,3 +561,128 @@ def test_telemetry_failure_never_breaks_the_turn(monkeypatch):
         {"role": "assistant", "content": "it is noon"},
     ])
     assert JaegerAgent(adapter=adapter).run_turn("what time is it?") == "it is noon"
+
+
+# ── words and a gesture in one message ─────────────────────────────
+
+
+def _gesture(done: list[str]):
+    @register_tool("avatar", "Move the body.", _SmallArgs, side_effect="gesture")
+    def _impl(value: str = "x") -> dict:
+        done.append(value)
+        return {"ok": True}
+
+
+def _says_and_moves(text):
+    return {"role": "assistant", "content": text, "tool_calls": [
+        {"id": "g1", "name": "avatar", "arguments": {"value": "wave"}}]}
+
+
+def test_words_plus_a_gesture_end_the_turn_with_those_words():
+    done: list[str] = []
+    _gesture(done)
+    adapter = _ScriptedAdapter([_says_and_moves("So happy to see you!")])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("hi") == "So happy to see you!"
+    assert (adapter.call_count, done) == (1, ["wave"])
+    assert agent.messages[-1]["role"] == "tool"  # the model sees next turn how the move went
+
+
+def test_a_gesture_without_words_still_gets_a_reply():
+    done: list[str] = []
+    _gesture(done)
+    adapter = _ScriptedAdapter([_says_and_moves(None), {"role": "assistant", "content": "Hi!"}])
+    assert JaegerAgent(adapter=adapter).run_turn("hi") == "Hi!"
+    assert (adapter.call_count, done) == (2, ["wave"])
+
+
+def test_words_plus_a_tool_that_reports_back_keep_the_loop():
+    done: list[str] = []
+    _gesture(done)
+
+    @register_tool("get_time", "Get the time.", _SmallArgs)
+    def _impl(value: str = "x") -> dict:
+        return {"now": "12:00"}
+
+    both = _says_and_moves("Let me check.")
+    both["tool_calls"].append({"id": "t1", "name": "get_time", "arguments": {}})
+    adapter = _ScriptedAdapter([both, {"role": "assistant", "content": "It is noon."}])
+    assert JaegerAgent(adapter=adapter).run_turn("what time is it?") == "It is noon."
+    assert adapter.call_count == 2
+
+
+def test_a_chained_request_keeps_the_loop_after_words_and_a_gesture():
+    done: list[str] = []
+    _gesture(done)
+    adapter = _ScriptedAdapter([_says_and_moves("Waving!"), {"role": "assistant", "content": "And done."}])
+    assert JaegerAgent(adapter=adapter).run_turn("wave, then tell me a joke") == "And done."
+
+
+# ── a performance: what the tool does is the reply ─────────────────
+
+
+def _performance(answers: list[dict]):
+    @register_tool("scene", "Perform a scene.", _SmallArgs, side_effect="performance")
+    def _impl(value: str = "x") -> dict:
+        return answers.pop(0)
+
+
+def _performs(text, value="say Hi."):
+    return {"role": "assistant", "content": text, "tool_calls": [
+        {"id": f"p{value}", "name": "scene", "arguments": {"value": value}}]}
+
+
+def test_a_performance_ends_the_turn_with_no_words_even_on_a_chained_request():
+    _performance([{"ok": True}])
+    adapter = _ScriptedAdapter([_performs(None), {"role": "assistant", "content": "I looked left and asked!"}])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("look left, then ask me something") == ""   # the scene is the reply: nothing narrates it
+    assert adapter.call_count == 1
+    assert agent.messages[-1]["role"] == "tool"
+
+
+def test_words_with_a_performance_and_a_gesture_are_the_reply():
+    done: list[str] = []
+    _gesture(done)
+    _performance([{"ok": True}])
+    both = _performs("Watch this!")
+    both["tool_calls"].append({"id": "g1", "name": "avatar", "arguments": {"value": "wave"}})
+    adapter = _ScriptedAdapter([both])
+    assert JaegerAgent(adapter=adapter).run_turn("put on a show") == "Watch this!"
+    assert (adapter.call_count, done) == (1, ["wave"])
+
+
+def test_a_refused_performance_goes_back_to_the_model_to_fix():
+    _performance([{"ok": False, "error": "Step 2: 'bow' needs a value"}, {"ok": True}])
+    adapter = _ScriptedAdapter([_performs(None, "say Hi. | bow"), _performs("Here goes.", "say Hi. | action bow")])
+    assert JaegerAgent(adapter=adapter).run_turn("say hi and bow") == "Here goes."
+    assert adapter.call_count == 2
+
+
+def test_a_performance_beside_a_tool_that_reports_back_keeps_the_loop():
+    _performance([{"ok": True}])
+
+    @register_tool("get_time", "Get the time.", _SmallArgs)
+    def _impl(value: str = "x") -> dict:
+        return {"now": "12:00"}
+
+    both = _performs(None)
+    both["tool_calls"].append({"id": "t1", "name": "get_time", "arguments": {}})
+    adapter = _ScriptedAdapter([both, {"role": "assistant", "content": "It is noon."}])
+    assert JaegerAgent(adapter=adapter).run_turn("perform, and what time is it?") == "It is noon."
+
+
+def test_each_later_model_call_of_a_turn_starts_on_a_new_line_for_listeners():
+    @register_tool("get_time", "Get the time.", _SmallArgs)
+    def _impl(value: str = "x") -> dict:
+        return {"now": "12:00"}
+
+    pieces: list[str] = []
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": "Let me check.", "tool_calls": [
+            {"id": "t1", "name": "get_time", "arguments": {}}]},
+        {"role": "assistant", "content": "It is noon."},
+    ])
+    agent = JaegerAgent(adapter=adapter, callbacks=AgentCallbacks(stream_delta=pieces.append))
+    agent.run_turn("what time is it?")
+    assert pieces == ["\n"]  # the scripted model streams nothing itself; the break is the loop's

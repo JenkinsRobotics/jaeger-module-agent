@@ -14,5 +14,5 @@
   "status": "verified_2026-09-02",
   "implementation": "runtime.py:build",
   "lineage": "gemma_multimodal-decomposition",
-  "notes": "large-v3-turbo, ceiling-exact on the turn path (2.78/1.18% clean WER). One lock: preview and final share the model."
+  "notes": "Hears through the Jaeger module filling the stt slot (jaeger-whisper-stt today); no loader of its own. large-v3-turbo, ceiling-exact on the turn path (2.78/1.18% clean WER). One lock: preview and final share the model."
 }

@@ -585,6 +585,17 @@ def test_parse_response_salvages_drift_tool_calls_from_text():
     assert "thinking" in parsed["content"]
 
 
+def test_parse_response_takes_a_bare_gemma_call_out_of_the_words():
+    """The bare ``<call:name{…}>`` form sits between sentences: the call
+    runs and only the words stay in what is shown and spoken."""
+    a = LocalLlamaAdapter(llama=_FakeLlama(_mk_response("ok")))
+    parsed = a.parse_response(_mk_response(
+        content='A puppy, wow! <call:avatar{emotion:<|"|>joy<|"|>}> You must be so excited!'))
+    assert parsed["tool_calls"][0]["name"] == "avatar"
+    assert parsed["tool_calls"][0]["arguments"] == {"emotion": "joy"}
+    assert parsed["content"].split() == "A puppy, wow! You must be so excited!".split()
+
+
 def test_parse_response_merges_structured_and_drift_calls():
     """Real-world: chat handler gives us ONE structured call and the
     model emits a SECOND one as text. The dispatcher needs both."""
@@ -956,3 +967,223 @@ def test_tool_prose_refreshes_when_same_name_schema_changes():
     refreshed = prompt(NewArgs, 'New description')
     assert 'new_action' in refreshed and 'New description' in refreshed
     assert 'old_action' not in refreshed and 'Old description' not in refreshed
+
+
+# ── streaming: live text for whoever is listening ──────────────────
+
+
+class _StreamLlama(_HybridLlama):
+    """Streams when asked to, the way llama-cpp does: an iterator of
+    plain-dict chunks instead of one response."""
+
+    def create_chat_completion(self, **kwargs: Any) -> Any:
+        self.last_chat_kwargs = kwargs
+        if not kwargs.get("stream"):
+            return _mk_response("Hello")
+        return iter([
+            {"choices": [{"delta": {"role": "assistant"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "Hel"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "lo"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ])
+
+    def create_completion(self, **kwargs: Any) -> Any:
+        self.last_completion_kwargs = kwargs
+        if not kwargs.get("stream"):
+            return super().create_completion(**kwargs)
+        return iter([
+            {"choices": [{"text": "[wave] ", "finish_reason": None}]},
+            {"choices": [{"text": "Hi.", "finish_reason": None}]},
+            {"choices": [{"text": "", "finish_reason": "stop"}]},
+        ])
+
+
+def test_listener_gets_text_pieces_as_the_model_writes_them():
+    """An in-process model must feed ``on_delta`` piece by piece, or a
+    voice waits for the whole reply before its first word."""
+    fake = _StreamLlama()
+    fake.metadata = {}   # a plain model: no thinking mode
+    a = LocalLlamaAdapter(llama=fake)
+    pieces: list[str] = []
+    raw = a.call({"model": "x", "messages": []}, threading.Event(),
+                 on_delta=pieces.append)
+    assert pieces == ["Hel", "lo"]
+    assert fake.last_chat_kwargs["stream"] is True
+    assert raw["choices"][0]["message"]["content"] == "Hello"
+
+
+def test_no_listener_keeps_the_single_blocking_call():
+    fake = _StreamLlama()
+    fake.metadata = {}
+    a = LocalLlamaAdapter(llama=fake)
+    raw = a.call({"model": "x", "messages": []}, threading.Event())
+    assert fake.last_chat_kwargs["stream"] is False
+    assert raw["choices"][0]["message"]["content"] == "Hello"
+
+
+def test_thinking_off_path_streams_too():
+    """``enable_thinking=False`` goes through ``create_completion``; its
+    text chunks must reach the listener as chat pieces."""
+    fake = _StreamLlama()
+    a = LocalLlamaAdapter(llama=fake, enable_thinking=False)
+    kw = a.format_messages([{"role": "user", "content": "hi"}], [], "sys")
+    pieces: list[str] = []
+    raw = a.call(kw, threading.Event(), on_delta=pieces.append)
+    assert pieces == ["[wave] ", "Hi."]
+    assert fake.last_completion_kwargs["stream"] is True
+    assert raw["choices"][0]["message"]["content"] == "[wave] Hi."
+    assert raw["choices"][0]["finish_reason"] == "stop"
+
+
+def test_reasoning_model_does_not_stream_its_thinking():
+    """A model that writes ``<think>`` text first keeps the blocking
+    call: its deliberation must never reach a listener (it would be
+    spoken aloud). ``parse_response`` strips it afterwards, as before."""
+    fake = _StreamLlama()
+    a = LocalLlamaAdapter(llama=fake,
+                          model_path="/m/DeepSeek-R1-0528-Qwen3-8B.gguf",
+                          enable_thinking=True)
+    pieces: list[str] = []
+    a.call({"model": "x", "messages": []}, threading.Event(),
+           on_delta=pieces.append)
+    assert pieces == []
+    assert fake.last_chat_kwargs["stream"] is False
+
+
+def test_interrupt_mid_stream_raises_and_resets_the_model():
+    """A barge-in while text is streaming stops the turn and leaves the
+    shared model clean for the next one."""
+    ev = threading.Event()
+
+    class _Talker:
+        resets = 0
+
+        def reset(self) -> None:
+            _Talker.resets += 1
+
+        def create_chat_completion(self, **kwargs: Any) -> Any:
+            def chunks():
+                yield {"choices": [{"delta": {"content": "one "}, "finish_reason": None}]}
+                ev.set()
+                yield {"choices": [{"delta": {"content": "two"}, "finish_reason": None}]}
+            return chunks()
+
+    a = LocalLlamaAdapter(llama=_Talker())
+    pieces: list[str] = []
+    with pytest.raises(AgentInterrupted):
+        a.call({"model": "x", "messages": []}, ev, on_delta=pieces.append)
+    assert pieces == ["one "]
+    assert _Talker.resets >= 1
+
+
+def test_tool_call_example_is_written_in_the_loaded_models_own_call_form():
+    """An app that wants to show the model one call (a small model follows
+    an example far better than a description) asks the adapter, so the app
+    never holds one model's syntax."""
+    from jaeger_agent.dialects import extract_tool_calls
+
+    gemma = LocalLlamaAdapter(model_path="/tmp/gemma-4-E4B-it-Q4_K_M.gguf")
+    example = gemma.tool_call_example("avatar", {"emotion": "joy", "times": 2})
+    assert example == '<|tool_call>call:avatar{emotion:<|"|>joy<|"|>,times:2}<tool_call|>'
+    calls = extract_tool_calls(example)  # the parser reads back what we show
+    assert [(c["name"], c["arguments"]) for c in calls] == [("avatar", {"emotion": "joy", "times": 2})]
+
+    hermes = LocalLlamaAdapter(model_path="/tmp/Hermes-3-Llama-3.1-8B.gguf")
+    assert hermes.tool_call_example("avatar", {"emotion": "joy"}) == (
+        '<tool_call>\n{"name": "avatar", "arguments": {"emotion": "joy"}}\n</tool_call>')
+
+    unknown = LocalLlamaAdapter(model_path="/tmp/fake-model.gguf")
+    assert unknown.tool_call_example("avatar", {"emotion": "joy"}) == ""
+
+
+# ── tool results in the model's own shape ──────────────────────────
+
+# Stands in for gemma-4's template: results are ``tool_responses`` on the
+# model's own turn, and there is no "tool" turn at all.
+_RESPONSES_TEMPLATE = (
+    "{%- for m in messages %}{{- '|' + m.role + ':' }}"
+    "{%- for r in m.tool_responses or [] %}{{- 'response:' + r.name + ' ' }}{%- endfor %}"
+    "{{- m.content or '' }}{%- endfor %}"
+    "{%- if enable_thinking is defined %}{{- '|T' }}{%- endif %}"
+)
+
+
+def _call(name: str, call_id: str) -> dict[str, Any]:
+    return {"role": "assistant", "content": None, "tool_calls": [{
+        "id": call_id, "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }]}
+
+
+def _sent_through(template: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fake = _FakeLlama(_mk_response("ok"))
+    fake.metadata = {"tokenizer.chat_template": template}
+    LocalLlamaAdapter(llama=fake).call({"messages": messages}, threading.Event())
+    assert fake.last_kwargs is not None
+    return fake.last_kwargs["messages"]
+
+
+def test_a_tool_result_reaches_a_tool_responses_template_inside_the_models_turn():
+    """Regression (Jaeger Avatar, 2026-11-11): gemma-4 got each result as
+    a made-up ``<|turn>tool`` turn of raw JSON. With a few turns of
+    history it then answered "What time is it?" in the same message as
+    its ``get_time`` call and kept its own made-up time."""
+    asked = [
+        {"role": "user", "content": "What time is it?"},
+        _call("get_time", "c1"),
+        {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
+    ]
+    sent = _sent_through(_RESPONSES_TEMPLATE, asked)
+    assert [m["role"] for m in sent] == ["user", "assistant"]
+    assert sent[1]["tool_responses"] == [{"name": "get_time", "response": {"time": "noon"}}]
+    assert sent[1]["content"] == ""  # the turn is still open: the model answers in it
+    assert "tool_responses" not in asked[1]  # the caller's messages are left alone
+
+
+def test_the_answer_after_a_tool_result_closes_that_same_turn():
+    sent = _sent_through(_RESPONSES_TEMPLATE, [
+        {"role": "user", "content": "What time is it?"},
+        _call("get_time", "c1"),
+        {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
+        {"role": "assistant", "content": "It is noon."},
+        {"role": "user", "content": "Thanks."},
+    ])
+    assert [m["role"] for m in sent] == ["user", "assistant", "user"]
+    assert sent[1]["tool_responses"][0]["name"] == "get_time"
+    assert sent[1]["content"] == "It is noon."
+
+
+def test_a_second_round_of_calls_stays_its_own_message_and_plain_text_results_stay_text():
+    sent = _sent_through(_RESPONSES_TEMPLATE, [
+        _call("get_time", "c1"),
+        {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
+        _call("avatar", "c2"),
+        {"role": "tool", "tool_call_id": "c2", "content": "waved"},
+        {"role": "assistant", "content": "It is noon."},
+    ])
+    assert [m["role"] for m in sent] == ["assistant", "assistant"]
+    assert sent[0]["content"] == ""
+    assert sent[1]["tool_responses"] == [{"name": "avatar", "response": "waved"}]
+    assert sent[1]["content"] == "It is noon."
+
+
+def test_a_template_with_its_own_tool_turn_keeps_it():
+    sent = _sent_through(_HybridLlama._HYBRID_TEMPLATE, [
+        _call("get_time", "c1"),
+        {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
+    ])
+    assert [m["role"] for m in sent] == ["assistant", "tool"]
+    assert "tool_responses" not in sent[0]
+
+
+def test_the_thinking_toggle_prompt_carries_tool_results_the_same_way():
+    fake = _HybridLlama()
+    fake.metadata = {"tokenizer.chat_template": _RESPONSES_TEMPLATE}
+    a = LocalLlamaAdapter(llama=fake, enable_thinking=False)
+    kw = a.format_messages([
+        {"role": "user", "content": "What time is it?"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "name": "get_time", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
+    ], [], "")
+    assert kw["_thinking_prompt"] == "|user:What time is it?|assistant:response:get_time |T"

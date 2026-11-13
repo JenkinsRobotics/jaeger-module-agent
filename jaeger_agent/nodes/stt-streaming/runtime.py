@@ -150,8 +150,6 @@ class SentenceCommitter:
 
 SAMPLE_RATE = 16000
 
-T_UNITS = 0.01                    # whisper timestamps are centiseconds
-
 EDGE_GUARD_S = 1.0
 
 def compact(text: str) -> str:
@@ -311,12 +309,12 @@ class IncrementalTranscriber:
         audio = np.concatenate([snapshot, self.pad])
         kwargs = {"language": self.language}
         if abort_cb is not None:
-            kwargs["abort_callback"] = abort_cb
+            kwargs["abort"] = abort_cb
         _tail = " ".join(" ".join(self.all_committed).split()[-12:])
         # gated: fragments poison conversational decodes (measured −2 pts on
         # AMI); only a tail ending at a sentence boundary is fed forward
         if _tail and _tail.rstrip()[-1:] in ".!?":
-            kwargs["initial_prompt"] = _tail
+            kwargs["prompt"] = _tail
         segs = self.model.transcribe(audio, **kwargs)
         raw = compact(" ".join(s.text for s in segs))
         self._last_raw = raw
@@ -331,7 +329,7 @@ class IncrementalTranscriber:
             return []
 
         edge = snapshot.size - int(EDGE_GUARD_S * self.sample_rate)
-        tail_hot = bool(segs) and int(segs[-1].t1 * T_UNITS * self.sample_rate) >= edge
+        tail_hot = bool(segs) and segs[-1].end_ms * self.sample_rate // 1000 >= edge
         newly = self.committer.update(text, allow_tail_commit=not tail_hot)
         # Event-only "sentences" are dropped from the RETURNED commits and
         # the transcript — but they must still enter the ledger and drive
@@ -350,18 +348,18 @@ class IncrementalTranscriber:
         span = snapshot[: int(self.soft_cap_s * self.sample_rate)]
         kwargs = {"language": self.language}
         if abort_cb is not None:
-            kwargs["abort_callback"] = abort_cb
+            kwargs["abort"] = abort_cb
         _tail = " ".join(" ".join(self.all_committed).split()[-12:])
         # gated: fragments poison conversational decodes (measured −2 pts on
         # AMI); only a tail ending at a sentence boundary is fed forward
         if _tail and _tail.rstrip()[-1:] in ".!?":
-            kwargs["initial_prompt"] = _tail
+            kwargs["prompt"] = _tail
         segs = self.model.transcribe(np.concatenate([span, self.pad]), **kwargs)
         guard = span.size - int(EDGE_GUARD_S * self.sample_rate)
         keep = []
         cut = 0
         for sg in segs:
-            t1 = int(sg.t1 * T_UNITS * self.sample_rate)
+            t1 = sg.end_ms * self.sample_rate // 1000
             if t1 >= guard:
                 break
             piece = compact(sg.text)
@@ -439,7 +437,7 @@ class IncrementalTranscriber:
             words = compact(sg.text).lower().split()
             if not words or acc + len(words) > n_total:
                 break
-            t1_samples = int(sg.t1 * T_UNITS * self.sample_rate)
+            t1_samples = sg.end_ms * self.sample_rate // 1000
             if t1_samples >= edge:
                 break                    # t1 inflated to the window end — do not
                                          # cut audio we may not have heard yet
@@ -839,7 +837,6 @@ __all__ = [
     "STABLE_PASSES",
     "MIN_COMMIT_CHARS",
     "SAMPLE_RATE",
-    "T_UNITS",
     "EDGE_GUARD_S",
     "DECODE_EVERY_S",
     "DRIFT_MIN_BUFFER_S",

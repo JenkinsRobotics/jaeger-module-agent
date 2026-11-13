@@ -129,7 +129,7 @@ from jaeger_agent.core.runtime import create_runtime
 
 runtime = create_runtime(config={
     "model_path": "~/models/gemma-4-E4B-it-Q4_K_M.gguf",
-    "ctx": 8192,
+    "ctx": 32768,  # the default: room for the tool list
     "tools_enabled": True,  # default: full agentic tool loop
 })
 runtime.run_turn("what tools do you have?", session_key="s")

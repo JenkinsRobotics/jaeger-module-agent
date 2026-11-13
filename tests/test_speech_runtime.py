@@ -79,16 +79,16 @@ def test_segment_decode_uses_the_node_lock_and_keeps_timestamps():
     lock = threading.Lock()
     cancel = threading.Event()
 
-    def decode(audio, **options):
+    def decode(audio, *, language, prompt, abort):
         assert lock.locked()
         assert audio.dtype == np.float32
-        assert options == {"language": "en", "initial_prompt": "Hello.",
-                           "abort_callback": cancel.is_set}
-        return [SimpleNamespace(text="world", t0=7, t1=93)]
+        assert (language, prompt, abort) == ("en", "Hello.", cancel.is_set)
+        return [SimpleNamespace(text="world", start_ms=70, end_ms=930)]
 
     runtime = SpeechRuntime()
     runtime._loaded = True
     runtime.stt = SimpleNamespace(_lock=lock, model=SimpleNamespace(transcribe=decode))
+    # Hosts keep whisper.cpp's option names and centisecond timestamps.
     assert runtime.transcribe_segments([0.0], initial_prompt="Hello.", abort_callback=cancel.is_set) == [
         {"text": "world", "t0": 7, "t1": 93}]
     assert not lock.locked()
@@ -175,3 +175,19 @@ def test_device_failure_does_not_lock_future_speech(monkeypatch):
     assert closed == [True]
     assert not runtime._playback_lock.locked()
     assert not runtime._tts_lock.locked()
+
+
+def test_status_says_what_each_part_runs_on(monkeypatch) -> None:
+    from jaeger_agent.core import engine
+
+    voice = {"module": "some_voice", "version": "1.2", "model": "v", "compute": "mlx"}
+    hearing = {"module": "some_ears", "version": "3.4", "model": "m", "compute": "metal"}
+    node = lambda info: SimpleNamespace(load=lambda _say, **_options: None, info=info)
+    monkeypatch.setattr(engine, "tts_mod", SimpleNamespace(build=lambda: node(voice)))
+    monkeypatch.setattr(engine, "stt_mod", SimpleNamespace(build=lambda: node(hearing)))
+
+    status = SpeechRuntime(MultimodalConfig()).status()
+
+    assert status == {"voice": voice, "hearing": hearing}
+    status["voice"]["compute"] = "changed"          # a copy, not the node's own record
+    assert voice["compute"] == "mlx"

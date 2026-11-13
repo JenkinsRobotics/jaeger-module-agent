@@ -128,7 +128,10 @@ class _LlamaChatFacade:
         ``TypeError: Can only get item pairs from a mapping`` from
         Jinja's ``do_items`` filter.
         """
-        kwargs.pop("stream", None) or kwargs.setdefault("stream", False)
+        # ``stream=True`` (set by the adapter when a listener wants live
+        # text) makes llama-cpp return an iterator of chunks, which the
+        # parent's stream aggregator drains.
+        kwargs["stream"] = bool(kwargs.get("stream"))
         # llama-cpp accepts the same field names — only the auth-y bits
         # ride OpenAI's HTTP envelope and have no in-process equivalent.
         for hostonly in ("api_key", "base_url", "extra_headers", "timeout"):
@@ -146,9 +149,12 @@ class _LlamaChatFacade:
             return self._create_with_rendered_prompt(manual_prompt, kwargs)
         msgs = kwargs.get("messages")
         if isinstance(msgs, list):
-            kwargs["messages"] = [
-                _coerce_none_content(_decode_tool_call_args(m)) for m in msgs
-            ]
+            template = (getattr(self._llama, "metadata", None) or {}).get(
+                "tokenizer.chat_template") or ""
+            kwargs["messages"] = _fold_tool_results(
+                [_coerce_none_content(_decode_tool_call_args(m)) for m in msgs],
+                template,
+            )
         # Phase-8 hardening: sanitise tool schemas before handing them
         # to llama-cpp's grammar generator. The generator rejects
         # bare-string schema values, ``type: [X, "null"]`` arrays, and
@@ -223,7 +229,22 @@ class _LlamaChatFacade:
         }
         gen_kwargs = {k: v for k, v in kwargs.items() if k in gen_keys}
         raw = self._llama.create_completion(prompt=prompt, **gen_kwargs)
+        if gen_kwargs.get("stream"):
+            return _completion_chunks_as_chat(raw)
         return _wrap_completion_as_chat(raw)
+
+
+def _completion_chunks_as_chat(chunks: Any) -> Any:
+    """Streaming twin of :func:`_wrap_completion_as_chat`: re-shape each
+    ``create_completion`` chunk (``text``) into a chat chunk
+    (``delta.content``) for the parent's stream aggregator."""
+    for chunk in chunks:
+        choice = (chunk.get("choices") or [{}])[0]
+        yield {"choices": [{
+            "index": 0,
+            "delta": {"content": choice.get("text") or ""},
+            "finish_reason": choice.get("finish_reason"),
+        }]}
 
 
 def _wrap_completion_as_chat(raw: dict) -> dict:
@@ -268,6 +289,55 @@ def _coerce_none_content(msg: Any) -> Any:
     if isinstance(msg, dict) and msg.get("content") is None:
         return {**msg, "content": ""}
     return msg
+
+
+def _fold_tool_results(msgs: list[Any], template: str) -> list[Any]:
+    """Return ``msgs`` with tool results in the shape ``template`` writes.
+
+    The OpenAI wire shape carries each result as its own ``tool``
+    message. gemma-4's template has no such turn: a result is a
+    ``tool_responses`` entry on the model's own message, written right
+    after the call, and the model's answer continues that same turn.
+    Handed ``tool`` messages, the template writes a made-up
+    ``<|turn>tool`` turn of raw JSON the model was never trained on —
+    measured 2026-11-11: with a few turns of history it answered a time
+    question in the same message as its ``get_time`` call and kept its
+    own made-up time over the real result.
+
+    Templates that never mention ``tool_responses`` are left alone. The
+    caller's messages are not mutated.
+    """
+    if "tool_responses" not in template:
+        return msgs
+    import json as _json
+    out: list[Any] = []
+    names: dict[Any, str] = {}
+    for msg in msgs:
+        role = msg.get("role") if isinstance(msg, dict) else None
+        turn = out[-1] if out and out[-1].get("role") == "assistant" else None
+        if role == "assistant":
+            calls = msg.get("tool_calls") or []
+            for call in calls:
+                if isinstance(call, dict):
+                    names[call.get("id")] = (call.get("function") or {}).get("name")
+            if (turn is not None and turn.get("tool_responses")
+                    and not turn.get("content") and not calls):
+                turn["content"] = msg.get("content")  # the answer closes the turn its calls opened
+            else:
+                out.append(dict(msg))
+        elif role == "tool" and turn is not None:
+            text = msg.get("content")
+            try:
+                value = _json.loads(text) if isinstance(text, str) else text
+            except ValueError:
+                value = text
+            turn.setdefault("tool_responses", []).append({
+                "name": names.get(msg.get("tool_call_id")) or "unknown",
+                "response": text if value is None else value,
+            })
+        else:
+            out.append(dict(msg) if isinstance(msg, dict) else {"role": None, "content": msg})
+    return out
 
 
 def _decode_tool_call_args(msg: Any) -> Any:
@@ -351,9 +421,9 @@ class LocalLlamaAdapter(OpenAIAdapter):
     ) -> None:
         # Skip OpenAIAdapter's network kwargs entirely — we never talk
         # to an HTTP endpoint. Pass the bits that DO apply via super().
-        # ``stream_transport=False``: the facade's ``create`` is a
-        # blocking in-process call with no chunk stream to aggregate;
-        # progress comes from the per-token logits processor instead.
+        # ``stream_transport=False`` to start: a blocking in-process
+        # call, with progress from the per-token logits processor.
+        # :meth:`call` turns streaming on per call when a listener asks.
         super().__init__(
             provider="local-llama",
             model=model,
@@ -444,6 +514,12 @@ class LocalLlamaAdapter(OpenAIAdapter):
         self._tool_family = detect_family(name, template)
         self._is_reasoning = detect_reasoning(name, template)
         return self._tool_family
+
+    def tool_call_example(self, name: str, args: dict[str, Any]) -> str:
+        """One tool call written the way the loaded model writes it, for
+        an app to show in its prompt. Empty when the form is unknown."""
+        from ..dialects import example_tool_call
+        return example_tool_call(self._resolve_tool_family(), name, args)
 
     def _resolve_reasoning(self) -> bool:
         """Whether this model emits ``<think>`` deliberation. Resolved
@@ -595,7 +671,7 @@ class LocalLlamaAdapter(OpenAIAdapter):
         if not self._is_hybrid_thinking():
             return kwargs
         rendered = self._render_with_thinking(
-            kwargs.get("messages") or [],
+            _fold_tool_results(kwargs.get("messages") or [], self._chat_template_str()),
             kwargs.get("tools"),
             bool(self._enable_thinking),
         )
@@ -726,6 +802,16 @@ class LocalLlamaAdapter(OpenAIAdapter):
         # worker still stops at its next token instead of running on as
         # a zombie that corrupts the shared KV cache.
         self._abort_flag.clear()
+        # Stream text only when a listener wants it (``on_delta``: a
+        # voice speaking the reply as it is written) and the model can't
+        # open with ``<think>`` text, which must never be spoken. Calls
+        # on one adapter are serialised, so a per-call switch is safe.
+        # ponytail: thinking models keep the blocking call; give them a
+        # think-holdback scanner (as mlx.py has for stop markers) to stream.
+        thinks = self._resolve_reasoning() and not (
+            self._enable_thinking is False and self._is_hybrid_thinking()
+        )
+        self.stream_transport = kwargs.get("on_delta") is not None and not thinks
         # Re-arm the beacon: restart the no-progress timer AND clear
         # the first-touch mark so this call's TTFT is its own, not the
         # previous generation's.

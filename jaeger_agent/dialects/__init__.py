@@ -178,6 +178,14 @@ def render_tool_call_for(family: str, name: str, args: dict[str, Any]) -> str:
     return renderer(name, args) if renderer else ""
 
 
+def example_tool_call(family: str, name: str, args: dict[str, Any]) -> str:
+    """One call in ``family``'s own form, to show the model in a prompt.
+    Empty when the family's form is unknown."""
+    if family == "gemma":
+        return gemma.render_tool_call(name, args)
+    return render_tool_call_for(family, name, args)
+
+
 def render_tool_result_for(family: str, content: str) -> str:
     """Render a tool result as ``family``'s native text. Empty when the
     family isn't text-driven (Gemma / unknown)."""
@@ -250,6 +258,7 @@ __all__ = [
     # presentation
     "render_tools_for",
     "render_tool_call_for",
+    "example_tool_call",
     "render_tool_result_for",
     "textify_tool_history",
     "PROSE_FAMILIES",

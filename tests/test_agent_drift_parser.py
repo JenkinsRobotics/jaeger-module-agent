@@ -87,6 +87,19 @@ def test_extract_gemma_brace_form_missing_closing_token():
     assert calls[0]["arguments"] == {"name": "codebase-inspection"}
 
 
+def test_extract_gemma_bare_call_form_inside_a_reply():
+    """Seen live (2026-11-11, gemma-4 with a persona): the model drops the
+    ``<|tool_call>`` opener and closes with a bare ``>`` or ``/>``, in the
+    middle of its words. The call was lost and the markup was spoken."""
+    text = ('A puppy, wow! <call:avatar{emotion:<|"|>joy<|"|>,action:<|"|>heart<|"|>,'
+            'look:<|"|>up<|"|>}> You must be so excited!')
+    calls = extract_tool_calls(text)
+    assert [(c["name"], c["arguments"]) for c in calls] == [
+        ("avatar", {"emotion": "joy", "action": "heart", "look": "up"})]
+    calls = extract_tool_calls("Let me check. <call:get_time{}/>")
+    assert [(c["name"], c["arguments"]) for c in calls] == [("get_time", {})]
+
+
 def test_tolerant_fallback_does_not_fire_when_strict_matches():
     """A well-formed call (with the closing token) must parse via the
     strict path unchanged — the tolerant fallback only runs when strict

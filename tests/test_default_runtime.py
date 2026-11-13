@@ -186,6 +186,23 @@ def test_sessions_keep_separate_transcripts() -> None:
     rt.close()
 
 
+def test_lines_said_outside_a_turn_join_the_session_that_is_open() -> None:
+    rt = DefaultAgentRuntime(adapter=ScriptedAdapter())
+    rt.warmup(session_key="voice", system_prompt="voice system")
+
+    rt.note("voice", "(a scene)", "So, what did you do today?")
+    rt.note("nobody", "(a scene)", "Hello?")              # no such conversation: none is made up for it
+
+    assert rt.agent_for("voice").messages == [
+        {"role": "user", "content": "(a scene)"},
+        {"role": "assistant", "content": "So, what did you do today?"},
+    ]
+    assert rt.health()["sessions"] == 1
+    assert rt.run_turn("I went hiking.", session_key="voice").text == "done"   # and the next turn follows on
+    assert [m["role"] for m in rt.agent_for("voice").messages] == ["user", "assistant", "user", "assistant"]
+    rt.close()
+
+
 def test_session_search_is_in_the_default_toolset() -> None:
     from jaeger_agent.schemas.tool_bundles import resolve_toolsets
 
@@ -328,3 +345,24 @@ def test_health_does_not_create_a_default_session():
         assert rt.health()['tools'] == 0
     assert set(rt._sessions) == {'companion'}
     rt.close()
+
+
+def test_default_context_holds_the_default_tool_list_with_room_to_talk() -> None:
+    """Tools are on by default, so the default window has to fit them.
+
+    The list is counted the way the context guard counts it (which runs
+    high on purpose), and what is left for the system prompt and the
+    conversation must be at least the 8192 tokens the old default gave.
+    """
+    import jaeger_agent.tools  # noqa: F401 — registers the built-in tools
+    from jaeger_agent.util.context_guard import ContextBudget, ContextGuard
+    from jaeger_os.core.tools.tool_registry import get_tools
+
+    cfg = AgentConfig()
+    assert cfg.tools_enabled is True
+    tools = [t for t in get_tools() if not getattr(t, "beta", False)]
+    budget = ContextBudget(ctx_window=cfg.ctx)
+    needed = ContextGuard(budget)._estimate_tools_tokens(tools)
+    assert budget.prompt_budget - needed >= 8192, (
+        f"{len(tools)} tools need ~{needed} tokens; ctx is {cfg.ctx}"
+    )

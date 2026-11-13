@@ -50,6 +50,7 @@ def run_mic(engine: GemmaMultimodal) -> int:
             channels=1,
             dtype="float32",
             blocksize=engine.FRAME,
+            device=engine.config.input_device,     # None = system default
             callback=lambda audio, _n, _t, _s: frames.put(audio[:, 0].copy()),
         ):
             while True:
@@ -113,6 +114,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--silero-model-path", default="")
     parser.add_argument("--mmproj-path", default="")
     parser.add_argument("--voice", default="af_heart")
+    device = lambda v: int(v) if v.isdigit() else v     # index or name
+    parser.add_argument("--input-device", type=device, default=None,
+                        help="microphone sound card (index or name; default: system)")
+    parser.add_argument("--output-device", type=device, default=None,
+                        help="speaker sound card (index or name; default: system)")
     parser.add_argument(
         "--agentic-tools",
         action=argparse.BooleanOptionalAction,
@@ -150,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
         fallback_llm_model_path=args.model_path or defaults.fallback_llm_model_path,
         kokoro_voice=args.voice,
         output_mode=output_mode,
+        input_device=args.input_device,
+        output_device=args.output_device,
     )
     engine_module.dxr.BARGE_MODE = args.barge
     context.STRUCTURED_CONTEXT = not args.plain_context

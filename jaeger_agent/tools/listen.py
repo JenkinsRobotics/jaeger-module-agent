@@ -5,8 +5,8 @@
 
 A one-shot, atomic alternative to the ``--voice`` daemon. The mic is
 opened, recorded, and closed inside the call — no always-on listening,
-no background thread. The Whisper model is cached at module level so
-repeated calls don't reload weights.
+no background thread. Hearing comes from the Jaeger module filling the
+``stt`` slot, opened once and cached so repeated calls don't reload weights.
 """
 
 from __future__ import annotations
@@ -18,95 +18,48 @@ from typing import Any
 from jaeger_os.core.tools.tool_registry import register_tool_from_function
 
 
-# Reuse the same default the voice daemon uses for its "accurate" pass —
-# medium.en strikes the sharpest quality/latency balance for English on
-# Apple Silicon. Override by passing ``model=...`` on the call.
-_DEFAULT_MODEL = "medium.en"
+from jaeger_agent.core.policy import STT_MODEL as _DEFAULT_MODEL  # the agent's one default
+
 _SAMPLE_RATE = 16000
 _MIN_SECONDS = 1
 _MAX_SECONDS = 60
 
-# Cache the Whisper model across calls — first call pays the load cost
-# (~3-5s for medium.en), subsequent calls are decode-only.
-# The lock makes load + swap atomic: with multi-instance agents
-# (delegate sub-agents, deep think) two concurrent ``listen`` calls
-# could otherwise race the cache — one swapping in a different model
-# while the other is mid-transcribe.
+# Cache the hearing across calls — the first call pays the load, later calls
+# are decode-only.  The lock makes load + swap atomic: with multi-instance
+# agents (delegate sub-agents, deep think) two concurrent ``listen`` calls
+# could otherwise race the cache.
 _cached_model: Any = None
 _cached_model_name: str | None = None
 _model_lock = _threading.Lock()
 
 
 def _get_model(name: str) -> Any:
-    """Lazy-load + memoize the Whisper model. Re-loads when the caller
-    asks for a different model name (rare; usually one model per session).
-    Thread-safe — see ``_model_lock``."""
+    """Open (once) the hearing from whichever Jaeger module fills the ``stt``
+    slot — the same module the voice loop hears through.  Loaded and primed
+    by the module; re-opened only when a different model is asked for."""
     global _cached_model, _cached_model_name
     with _model_lock:
         if _cached_model is not None and _cached_model_name == name:
             return _cached_model
-        from pywhispercpp.model import Model
+        from jaeger_agent.core.parts import open_part
 
-        _cached_model = Model(
-            name,
-            print_realtime=False,
-            print_progress=False,
-            single_segment=False,
-            no_context=True,
-        )
+        # The same instance the voice loop hears through: one copy in memory.
+        _cached_model, _info = open_part("stt", "open_hearing", shared=True,
+                                         model=name)
         _cached_model_name = name
         return _cached_model
 
 
 def warm_listen() -> dict[str, Any]:
-    """Pre-load AND prime Whisper so the first ``listen`` call doesn't
-    pay JIT / kernel-selection overhead in addition to weight load.
-
-    Two stages, matching the Kokoro warm-up:
-
-      1. ``_get_model()`` — load weights (~3–5s cold).
-      2. Run a real ``transcribe`` over a short silent buffer so the
-         decoder graph + numpy/ggml kernels are picked + cached. The
-         transcript is discarded; the side-effect of pipeline priming
-         is what we want.
-
-    Without #2 the first real mic capture pays the kernel-selection
-    cost mid-decode, which on Apple Silicon shows up as the first
-    transcription occasionally producing garbled tokens before the
-    pipeline settles. Idempotent.
-    """
+    """Pre-load the hearing so the first ``listen`` call is decode-only.
+    The module primes itself on open.  Idempotent."""
     started = time.perf_counter()
-    load_s = 0.0
-    prime_s = 0.0
     try:
-        t0 = time.perf_counter()
-        model = _get_model(_DEFAULT_MODEL)
-        load_s = time.perf_counter() - t0
-
-        # Real decode on a short silent buffer. ``transcribe`` accepts
-        # a numpy float32 array at SAMPLE_RATE. One second of silence
-        # exercises the full pipeline without recording audio.
-        t1 = time.perf_counter()
-        try:
-            import numpy as np
-
-            silence = np.zeros(_SAMPLE_RATE, dtype=np.float32)
-            # pywhispercpp's transcribe() signature — quietly absorb
-            # any unexpected exception so a priming failure can't
-            # block boot.
-            _ = model.transcribe(silence)
-        except Exception:  # noqa: BLE001 — priming is best-effort
-            pass
-        prime_s = time.perf_counter() - t1
+        _get_model(_DEFAULT_MODEL)
     except Exception as exc:
         return {"warmed": False, "model": _DEFAULT_MODEL, "reason": str(exc)}
-    return {
-        "warmed": True,
-        "model": _DEFAULT_MODEL,
-        "seconds": round(time.perf_counter() - started, 3),
-        "load_s": round(load_s, 3),
-        "prime_s": round(prime_s, 3),
-    }
+    return {"warmed": True, "model": _DEFAULT_MODEL,
+            "seconds": round(time.perf_counter() - started, 3)}
 
 
 def listen(seconds: int = 5, model: str = _DEFAULT_MODEL) -> dict[str, Any]:
@@ -195,10 +148,13 @@ def listen(seconds: int = 5, model: str = _DEFAULT_MODEL) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"mic capture failed: {exc}"}
 
-    # pywhispercpp expects a 1D float32 array at 16 kHz.
+    # The hearing takes a 1D float32 array at 16 kHz.
     samples = np.asarray(audio, dtype="float32").reshape(-1)
     try:
-        segments = whisper.transcribe(samples)
+        from jaeger_agent.core.parts import HEARING_LOCK
+
+        with HEARING_LOCK:      # the voice loop may be hearing through it too
+            segments = whisper.transcribe(samples)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"transcribe failed: {exc}"}
 

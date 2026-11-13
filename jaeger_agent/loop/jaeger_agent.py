@@ -474,6 +474,12 @@ class JaegerAgent:
                 self.last_halt_reason = "interrupted"
                 break
 
+            # One turn can hold several model calls and they all feed the
+            # same listener. A line break tells it where one ends, so the
+            # voice never glues "…check." onto the next call's first word.
+            if iteration > 1:
+                self.callbacks.on_stream_delta("\n")
+
             # Deliver any mid-turn steering before the model step so
             # the very next call sees the user's course correction.
             self._drain_steers()
@@ -574,6 +580,26 @@ class JaegerAgent:
                             "nudging once]"
                         )
                         continue
+                return self._apply_mutation_footer(final_text)
+
+            # 5-gesture: the model spoke and only moved its body. A tool
+            # registered with side_effect="gesture" has a result that needs
+            # no words, so those words are the reply — another model call
+            # only repeats or pads them (measured on Gemma 4 E4B). The
+            # result stays in the history, so a refused move is seen on
+            # the next turn. A chained request keeps the full loop.
+            if (
+                final_text.strip()
+                and all(
+                    getattr(self._dispatch_by_name.get(tc.get("name") or ""),
+                            "side_effect", "") == "gesture"
+                    for tc in tool_calls
+                )
+                and not _looks_multistep(user_message)
+            ):
+                for tc in tool_calls:
+                    tool_calls_made += 1
+                    self._dispatch_one_tool(tc)
                 return self._apply_mutation_footer(final_text)
 
             # 5a: skip-final short-circuit. When the FIRST iteration
@@ -684,6 +710,16 @@ class JaegerAgent:
                     self.last_halt_reason = halt
                     return self._halt_turn()
 
+            # 6b-performance: every call moved the body and one was a
+            # performance (side_effect="performance": what the tool does
+            # IS the reply, e.g. a scene the host then performs). Once it
+            # is taken, the turn ends on the words that came with the
+            # call, even none, chained request or not: another model call
+            # only narrates what is about to be seen. A refused one stays
+            # in the loop, so the model reads why and tries again.
+            if self._performed(tool_calls):
+                return self._apply_mutation_footer(final_text)
+
         # Fell out of the for-loop: max_iterations exhausted with the
         # model still trying to use tools. Spend ONE toolless grace
         # call asking the model to wrap up — a spoken summary of what
@@ -694,6 +730,27 @@ class JaegerAgent:
             )
             return self._wind_down_summary()
         return self._halt_turn()
+
+    def _performed(self, tool_calls: list) -> bool:
+        """Whether this batch was gestures plus at least one performance,
+        and every performance was taken (its result does not say
+        ``ok: false``)."""
+        kinds = {tc.get("id") or "": getattr(
+            self._dispatch_by_name.get(tc.get("name") or ""), "side_effect", "")
+            for tc in tool_calls}
+        if "performance" not in kinds.values() or not set(kinds.values()) <= {"gesture", "performance"}:
+            return False
+        import json
+        for msg in self._turn_messages[-len(tool_calls):]:
+            if msg.get("role") != "tool" or kinds.get(msg.get("tool_call_id") or "") != "performance":
+                continue
+            try:
+                result = json.loads(msg.get("content") or "")
+            except ValueError:
+                return False
+            if not isinstance(result, dict) or result.get("ok") is False or "error" in result:
+                return False
+        return True
 
     def interrupt(self) -> None:
         """Signal the loop to bail at the next safe point. Idempotent —

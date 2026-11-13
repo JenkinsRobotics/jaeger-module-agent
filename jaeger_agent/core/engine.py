@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import difflib
 import importlib.util
+import inspect
 import queue
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
+from .audio import Speaker
 from .config import MultimodalConfig
 from .contracts import AgentRuntime, normalize_turn_result
 from .node import resolve_runtime_factory
 
 from . import context as ctx
+from . import scene
 from .context import (
     CONTEXT_PROMPT_ADDON,
     HOLD_MAX_S,
@@ -35,8 +39,12 @@ from .context import (
     llm_user_text,
 )
 from .events import Event, _TurnShim
-from .outputs import DYNAMIC_OUTPUT_PROMPT, OutputMode, decide_output, multimodal_output_scope
+from .outputs import (
+    DYNAMIC_OUTPUT_PROMPT, OutputMode, StreamedSpeech, decide_output,
+    multimodal_output_scope,
+)
 from .policy import (
+    EARLY_DECODE_MS,
     FRAME_MS,
     MIN_SPEECH_MS,
     SAMPLE_RATE,
@@ -144,7 +152,17 @@ class AgentRuntimeBrain:
             say("warming AgentRuntime brain…")
             warmup(session_key=self.session_key, system_prompt=system_prompt)
 
-    def answer(self, content: Any, system: str) -> str:
+    @property
+    def streams(self) -> bool:
+        """Whether the runtime can hand out a reply while it is written."""
+        turn = getattr(self.runtime, "run_multimodal_turn", None) or self.runtime.run_turn
+        try:
+            return "on_delta" in inspect.signature(turn).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def answer(self, content: Any, system: str, on_delta: Any = None) -> str:
+        extra = {} if on_delta is None else {"on_delta": on_delta}
         multimodal = getattr(self.runtime, "run_multimodal_turn", None)
         if callable(multimodal):
             value = multimodal(
@@ -152,9 +170,11 @@ class AgentRuntimeBrain:
                 text=_plain_text(content),
                 system_prompt=system,
                 session_key=self.session_key,
+                **extra,
             )
         elif isinstance(content, str):
-            value = self.runtime.run_turn(content, session_key=self.session_key)
+            value = self.runtime.run_turn(
+                content, session_key=self.session_key, **extra)
         else:
             raise RuntimeError(
                 "the injected AgentRuntime does not accept image content; "
@@ -167,6 +187,18 @@ class AgentRuntimeBrain:
 
     def remember(self, _user_text: str, _reply: str) -> None:
         """No-op: AgentRuntime is the sole conversation-memory owner."""
+
+    def note(self, user_text: str, reply: str) -> None:
+        """Something said outside a turn (a performed scene) joins the
+        runtime's transcript, when the runtime keeps one that can take it."""
+        note = getattr(self.runtime, "note", None)
+        if callable(note):
+            note(self.session_key, user_text, reply)
+
+    def switch(self, session_key: str) -> None:
+        """Move to another conversation; the one left behind stays as it is."""
+        self._base_session_key = session_key
+        self._generation = 0
 
     def clear(self) -> None:
         clear = getattr(self.runtime, "clear_session", None)
@@ -209,6 +241,7 @@ class GemmaMultimodal:
         runtime_config: Mapping[str, Any] | None = None,
         config: MultimodalConfig | Mapping[str, Any] | None = None,
         use_offline_fallback: bool = False,
+        outputs: Any = None,
     ) -> None:
         output_was_explicit = output_mode is not None
         if isinstance(config, Mapping):
@@ -245,6 +278,13 @@ class GemmaMultimodal:
         self.want_vision = want_vision
         self.extra_prompt = extra_prompt.strip()
         self.play = play
+        # Where the voice goes (see core/audio.py). The app's list wins; with
+        # none given it is this machine's speaker. The echo-cancelling modes
+        # play through their own duplex device, so they get no default.
+        if outputs is None:
+            outputs = ([Speaker(self.config.output_device)]
+                       if play and audio_mode in ("plain", "structured") else [])
+        self.outputs = list(outputs)
         self.llm = self.tts = self.stt = None
         # the agent is COMPOSED of nodes — each capability its own folder
         self.node_stt = stt_mod.build()
@@ -276,6 +316,11 @@ class GemmaMultimodal:
         self._started = 0.0
         self._hang = max(1, SILENCE_HANGOVER_MS // FRAME_MS)
         self._minb = max(1, MIN_SPEECH_MS // FRAME_MS)
+        # Hearing starts this many quiet frames in — before the endpoint — and
+        # its answer is used only if the quiet holds (see EARLY_DECODE_MS).
+        self._early_at = EARLY_DECODE_MS // FRAME_MS
+        self._early = None            # (pending words, "nobody needs this" flag)
+        self._decoder = ThreadPoolExecutor(1, thread_name_prefix="hearing")
 
         self.speaking = threading.Event()
         self._pending_image: str | None = None
@@ -292,8 +337,6 @@ class GemmaMultimodal:
         #: The original MicStream drains ITS queue on pause and on resume;
         #: this engine does not own the queue, so the owner hands us the drain.
         self.drain_input = lambda: None
-        # ONE STT lock: live preview and final decode share the node's lock.
-        self._stt_lock = self.node_stt._lock
         # ── audio pipeline: one of the four verified input modes ──
         assert audio_mode in ("plain", "structured", "quasi", "full"), audio_mode
         self.audio_mode = audio_mode
@@ -313,6 +356,8 @@ class GemmaMultimodal:
         # lock, so a typed message during duplex speech serializes instead
         # of racing the LLM
         self._respond_lock = threading.Lock()
+        self._staged = None               # a scene a tool staged in this turn
+        self._turn_t0: float | None = None   # for the "First audio" latency
         self._mode_lock = threading.Lock()
         self._pending_agentic_mode: bool | None = None
 
@@ -326,6 +371,18 @@ class GemmaMultimodal:
     def load(self) -> None:
         """Load perception/speech nodes and connect vision to the brain."""
         t0 = time.perf_counter()
+
+        # Hearing loads beside the voice and the model, not after them.
+        hearing = self._decoder.submit(
+            self.node_stt.load, self._say, model_name=self.config.stt_model)
+        # ponytail: the voice stays on this thread.  An MLX voice loaded on a
+        # worker crashes the process at exit, and its stdout redirect races
+        # llama's.  Load it in a process of its own if start-up must shrink.
+        self.node_tts.load(
+            self._say,
+            voice=self.config.kokoro_voice,
+            language=self.config.kokoro_language,
+        )
         handler = self.node_vision.load(
             self.want_vision,
             self._say,
@@ -342,13 +399,8 @@ class GemmaMultimodal:
                 system_prompt=self._system_prompt(),
             )
         self.llm = getattr(self.node_llm, "llm", None)
-        self.node_tts.load(
-            self._say,
-            voice=self.config.kokoro_voice,
-            language=self.config.kokoro_language,
-        )
+        hearing.result()                    # a part that failed fails start-up
         self.tts = self.node_tts.tts
-        self.node_stt.load(self._say, model_name=self.config.stt_model)
         self.stt = self.node_stt.model
         self._vad = SileroVad(self.config.silero_model_path)
 
@@ -358,7 +410,8 @@ class GemmaMultimodal:
                     "pyaec is required for quasi/full audio_mode; "
                     "install jaeger-agent[multimodal-duplex]")
             self._say(f"opening 48 kHz AEC duplex device ({self.audio_mode} audio_mode)…")
-            self._io = AudioIO().__enter__()
+            self._io = AudioIO(self.config.input_device,
+                               self.config.output_device).__enter__()
             if self.audio_mode == "full":
                 self._sann = StreamAnnotator()
                 self._seng = IncrementalTranscriber(self.stt)
@@ -413,11 +466,9 @@ class GemmaMultimodal:
             return
         self._preview_decoded = len(frames)
         audio = np.concatenate(frames[-500:])          # cap the window at 15s
-        with self._stt_lock:
-            if not self._in_speech:                    # turn ended while queued
-                return
-            text = " ".join(x.text for x in
-                            self.stt.transcribe(audio, language="en")).strip()
+        # Gives way the moment the person goes quiet: the early pass is next.
+        text = self.node_stt.transcribe(
+            audio, abort=lambda: self._early is not None or not self._in_speech)
         if text and self._in_speech:
             self._emit("live", text + " \u258c")
 
@@ -502,21 +553,31 @@ class GemmaMultimodal:
             self._frames.append(frame)
             self._voiced += 1
             self._silent = 0
+            if self._early is not None:        # they kept talking: not the end
+                self._early[0].cancel()
+                self._early[1].set()
+                self._early = None
             return
         if not self._in_speech:
             return
         self._frames.append(frame)
         self._silent += 1
+        if self._silent == self._early_at and self._voiced >= self._minb:
+            unwanted = threading.Event()
+            self._early = (self._decoder.submit(
+                self.node_stt.transcribe, np.concatenate(self._frames),
+                abort=unwanted.is_set), unwanted)
         if not (self._voiced >= self._minb and self._silent >= self._hang):
             return
         audio = np.concatenate(self._frames)
         self._in_speech = False
         self._frames = []
         self._voiced = self._silent = 0
-        self._on_turn(audio)
+        early, self._early = self._early, None
+        self._on_turn(audio, early[0] if early else None)
 
     # -- the five stages ---------------------------------------------------
-    def _on_turn(self, audio: np.ndarray) -> None:
+    def _on_turn(self, audio: np.ndarray, early=None) -> None:
         t_end = time.perf_counter()
         self._emit("latency", "Speech detected",
                    (time.time() - self._started) * 1000)
@@ -524,7 +585,7 @@ class GemmaMultimodal:
         self._emit("state", "transcribing")
 
         self._preview_decoded = 0
-        heard = self.node_stt.transcribe(audio)
+        heard = early.result() if early is not None else self.node_stt.transcribe(audio)
         if not heard:
             self._emit("state", "listening")
             return
@@ -564,8 +625,9 @@ class GemmaMultimodal:
             self._emit("live", "")
             return
 
-        in_window = turn_started_in_followup(self._started,
-                                               self._followup_deadline)
+        in_window = (not self.config.wake_required
+                     or turn_started_in_followup(self._started,
+                                                 self._followup_deadline))
         hit = _match_wake(heard)            # stage 4: addressed to us?
         if hit is None and not in_window:
             self._emit("overheard", heard)
@@ -627,6 +689,7 @@ class GemmaMultimodal:
         input_modality: str = "speech",
     ) -> None:
         self._force_listen_evt.clear()
+        self._staged = None
         with self._mode_lock:
             enabled, self._pending_agentic_mode = self._pending_agentic_mode, None
         if enabled is not None:
@@ -647,16 +710,50 @@ class GemmaMultimodal:
         # the GUI can show what was SUBMITTED, not just what was heard
         self._emit("submitted",
                    user_text + ("  [+image]" if image is not None else ""))
+        self._turn_t0 = t_end
+        modality = "text" if input_modality == "text" else "speech"
+        # Speak each sentence as soon as it is written — the voice runs beside
+        # the model instead of waiting for the whole reply.
+        sentences: queue.Queue = queue.Queue()
+        speaker: threading.Thread | None = None
+        stream = None
+        if getattr(self.node_llm, "streams", False) and self.config.output_mode != "text":
+            stream = StreamedSpeech(mode=self.config.output_mode, input_modality=modality)
+
+        started = False
+
+        def on_delta(piece: str) -> None:
+            nonlocal speaker, started
+            if not started:
+                started = True
+                self._emit("latency", "First token", (time.perf_counter() - t_end) * 1000)
+            for sentence in stream.feed(piece):
+                if speaker is None:
+                    self._emit("latency", "First words", (time.perf_counter() - t_end) * 1000)
+                    self._emit("state", "speaking")
+                    speaker = threading.Thread(target=speak_all, daemon=True)
+                    speaker.start()
+                sentences.put(sentence)
+
+        failed: list[BaseException] = []
+
+        def speak_all() -> None:
+            try:
+                self._speak(iter(sentences.get, None))
+            except Exception as exc:      # a voice failure must reach the turn
+                failed.append(exc)
+
         with multimodal_output_scope():
-            reply = self._answer(user_text, image)
+            reply = (self._answer(user_text, image) if stream is None
+                     else self._answer(user_text, image, on_delta))
         if self._force_listen_evt.is_set():
+            if speaker is not None:
+                sentences.put(None)
+                speaker.join()
             self._emit("state", "listening")
             return
         decision = decide_output(
-            mode=self.config.output_mode,
-            input_modality="text" if input_modality == "text" else "speech",
-            reply=reply,
-        )
+            mode=self.config.output_mode, input_modality=modality, reply=reply)
         self._remember(command, reply)
         self._emit("latency", "Reply ready", (time.perf_counter() - t_end) * 1000)
         self._emit(
@@ -673,12 +770,22 @@ class GemmaMultimodal:
                 "source": decision.source,
             },
         )
-        if decision.speech_text:
+        if speaker is not None:
+            sentences.put(stream.rest(decision.speech_text) or None)
+            sentences.put(None)
+            speaker.join()
+            if failed:
+                raise failed[0]
+            self._emit("latency", "Spoken", (time.perf_counter() - t_end) * 1000)
+        elif decision.speech_text:
             self._emit("state", "speaking")
             self._speak(decision.speech_text)
             self._emit("latency", "Spoken", (time.perf_counter() - t_end) * 1000)
         else:
             self._emit("latency", "Spoken", None)
+        staged, self._staged = self._staged, None
+        if staged and not self._force_listen_evt.is_set():
+            self._speak_scene(staged)     # the scene a tool staged this turn
         self._emit("state", "listening")
         self._turns += 1
         visible_reply = decision.display_text or decision.speech_text or reply
@@ -698,10 +805,12 @@ class GemmaMultimodal:
             system = f"{system}{DYNAMIC_OUTPUT_PROMPT}"
         return system
 
-    def _answer(self, user_text: str, image) -> str:
+    def _answer(self, user_text: str, image, on_delta=None) -> str:
         system = self._system_prompt()
         content = self.node_vision.content(user_text, image)
-        return self.node_llm.answer(content, system)
+        if on_delta is None:
+            return self.node_llm.answer(content, system)
+        return self.node_llm.answer(content, system, on_delta)
 
     def _remember(self, user_text: str, reply: str) -> None:
         """Fallback history only; the AgentRuntime implementation is a no-op."""
@@ -773,6 +882,96 @@ class GemmaMultimodal:
         with self._mode_lock:
             self._pending_agentic_mode = bool(enabled)
 
+    def switch_session(self, session_key: str, extra_prompt: str = "", *,
+                       voice: str | None = None) -> None:
+        """Move to another conversation with its own persona and voice.
+
+        For an app with several characters: a session's system prompt is fixed
+        when the session is first built, so each character gets its own key —
+        and keeps its own conversation when the app comes back to it. ``voice``
+        is the character's voice in the loaded voice module; left out, the
+        voice stays as it is.
+        """
+        if voice:
+            self.node_tts.set_voice(voice)
+        self.extra_prompt = extra_prompt.strip()
+        self.node_llm.switch(session_key)
+        self.node_llm.load(None, self._say, system_prompt=self._system_prompt())
+
+    # -- what an app needs without reaching into the nodes ------------------
+    @property
+    def sample_rate(self) -> int:
+        """The rate of the sound in ``audio`` events and from :meth:`synth`."""
+        return getattr(self.node_tts, "sample_rate", TTS_RATE)
+
+    def synth(self, text: str, *, voice: str | None = None):
+        """One line through the voice alone — no model, no turn, no events.
+        Yields the voice module's chunks (sound, with ``marks`` for the lips),
+        in the set voice or, for this line, in ``voice``."""
+        yield from self.node_tts.synth(text, **({"voice": voice} if voice else {}))
+
+    def perform(self, script, fit=None) -> None:
+        """Perform a scene (:mod:`.scene`): its lines in the agent's own voice,
+        no model, each with its moves on it as cues (``audio`` events whose
+        sound has ``cues`` beside its ``marks``) for whoever plays the sound to
+        make on the sound's clock. A bad scene raises before a word is said.
+        ``fit`` is the body's say on each call a cue will make (see
+        :func:`.scene.lines`): it may leave parts out, or refuse the scene."""
+        lines = scene.lines(script, fit)
+        said = " ".join(line for line in lines if line)
+        with self._respond_lock:
+            self._force_listen_evt.clear()
+            self._emit("state", "speaking")
+            self._speak_scene(lines)
+            if said and not self._force_listen_evt.is_set():
+                # The lines join the conversation, so she can be answered.
+                getattr(self.node_llm, "note", self.node_llm.remember)(scene.DIRECTION, said)
+                self._emit("assistant", said,
+                           {"display": True, "channels": ("speech",), "source": "scene"})
+            self._emit("state", "listening")
+
+    def stage(self, script, fit=None) -> int:
+        """From inside a turn (a tool the model called): take a scene to
+        perform once this turn's reply has been spoken. Returns how many
+        things it will voice; a bad scene, or one ``fit`` refuses (see
+        :meth:`perform`), raises and stages nothing."""
+        lines = scene.lines(script, fit)
+        self._staged = lines
+        return len(lines)
+
+    def _speak_scene(self, lines) -> None:
+        """Voice a scene's lines between ``scene`` "begin" and "end" events,
+        so a player can hold the clips until every line is voiced."""
+        self._emit("scene", "begin", {"lines": len(lines)})
+        self._speak(lines)
+        self._emit("scene", "end")
+
+    def _sound_of(self, line):
+        """A line's sound from the voice, chunk by chunk; a scene's line whole,
+        with its cues on it."""
+        if isinstance(line, scene.Line):
+            return scene.voiced(line, self.node_tts.synth, self.sample_rate)
+        return self.node_tts.synth(line)
+
+    def call_example(self, name: str, args: dict) -> str:
+        """One call of tool ``name`` the way the loaded model writes its calls,
+        for an app's prompt; empty when the model's call form is not known."""
+        adapter = getattr(getattr(self.node_llm, "runtime", None), "adapter", None)
+        show = getattr(adapter, "tool_call_example", None)
+        return show(name, args) if show else ""
+
+    def report(self) -> dict:
+        """What each part runs on right now: module, version, model, compute."""
+        runtime = getattr(self.node_llm, "runtime", None)
+        config = getattr(runtime, "config", None)
+        return {
+            "voice": dict(getattr(self.node_tts, "info", None) or {}),
+            "hearing": dict(getattr(self.node_stt, "info", None) or {}),
+            "agent": runtime.health() if hasattr(runtime, "health") else {},
+            **{key: getattr(config, key)
+               for key in ("ctx", "tools_enabled", "max_iterations") if hasattr(config, key)},
+        }
+
     def force_listen(self) -> None:
         """Cut current playback/generation and return the floor to input."""
         self._force_listen_evt.set()
@@ -785,12 +984,8 @@ class GemmaMultimodal:
                 self._emit("status", f"Agent connection lost during interruption: {exc}")
         if self._io is not None:
             self._io.interrupt_playback()
-        elif self.play:
-            try:
-                import sounddevice as sd
-                sd.stop()
-            except Exception:
-                pass
+        for out in self.outputs:
+            out.stop()
         self._emit("state", "listening")
 
     # -- duplex audio pipeline (quasi/full): engine-owned AEC device ------------------
@@ -898,18 +1093,25 @@ class GemmaMultimodal:
                 continue
             self._respond(utt, turns=turns)
 
-    def _speak_duplex(self, text: str) -> None:
+    def _first_audio(self) -> None:
+        if self._turn_t0 is not None:
+            self._emit("latency", "First audio",
+                       (time.perf_counter() - self._turn_t0) * 1000)
+            self._turn_t0 = None
+
+    def _speak_duplex(self, sentences) -> None:
         """03/04's continuous-watch speak on the engine-owned device: mic
         LIVE throughout, barge per dxr.BARGE_MODE, self-voice fingerprinted."""
         if self._force_listen_evt.is_set():
             return
-        self._last_spoken = text
+        self._last_spoken = ""
         self._last_spoken_at = time.time()
         self.speaking.set()
         io = self._io
         io.clear_barge()
         monitor = BargeMonitor()
         played: list[np.ndarray] = []
+        rate = getattr(self.node_tts, "sample_rate", TTS_RATE)
         state = {"barged": False, "stop": False}
 
         def _watch() -> None:
@@ -937,13 +1139,20 @@ class GemmaMultimodal:
         w = threading.Thread(target=_watch, daemon=True)
         w.start()
         try:
-            for chunk24 in self.node_tts.synth(text):
+            for text in sentences:
                 if state["barged"] or self._force_listen_evt.is_set():
                     break
-                played.append(chunk24)
-                self._emit("audio", text, chunk24)
-                if self.play:
-                    io.play_chunk(chunk24)
+                self._last_spoken = f"{self._last_spoken} {text}".strip()
+                for chunk24 in self._sound_of(text):
+                    if state["barged"] or self._force_listen_evt.is_set():
+                        break
+                    self._first_audio()
+                    played.append(chunk24)
+                    self._emit("audio", text, chunk24)
+                    if self.play:
+                        io.play_chunk(chunk24, rate)
+                    for out in self.outputs:
+                        out.play(chunk24, rate)
             while (self.play and io.is_playing() and not state["barged"]
                    and not self._force_listen_evt.is_set()):
                 time.sleep(0.02)
@@ -959,7 +1168,7 @@ class GemmaMultimodal:
                         "scipy is required for duplex self-voice rejection; "
                         "install jaeger-agent"
                     ) from exc
-                a16 = resample_poly(np.concatenate(played), up=2, down=3)
+                a16 = resample_poly(np.concatenate(played), up=SAMPLE_RATE, down=rate)
                 _SELF_VOICE["fp"] = TurnAnnotator.fingerprint(
                     a16.astype(np.float32))
                 _SELF_VOICE["until"] = time.time() + SELF_ECHO_WINDOW_S
@@ -967,8 +1176,12 @@ class GemmaMultimodal:
             self._last_spoken_at = time.time()
 
     # -- output 2: audio ---------------------------------------------------
-    def _speak(self, text: str) -> None:
+    def _speak(self, text) -> None:
         """Faithful port of the shipped companion's speak() — the solved setup.
+
+        ``text`` is the whole reply, or an iterable that hands out its
+        sentences as the model finishes them (each is voiced on its own, so
+        the first one is heard while the rest is still being written).
 
         Everything here exists because its absence was once a live bug:
 
@@ -985,33 +1198,31 @@ class GemmaMultimodal:
         """
         if not text or self._force_listen_evt.is_set():
             return
+        sentences = [text] if isinstance(text, str) else text
         if self._io is not None:
-            return self._speak_duplex(text)
-        self._last_spoken = text
+            return self._speak_duplex(sentences)
+        self._last_spoken = ""
         self._last_spoken_at = time.time()
         self.speaking.set()
         self.drain_input()
         started = False
+        rate = getattr(self.node_tts, "sample_rate", TTS_RATE)
         try:
-            if self.play:
-                try:
-                    import sounddevice as sd
-                except ImportError as exc:
-                    raise RuntimeError(
-                        "sounddevice is required for playback; "
-                        "install jaeger-agent"
-                    ) from exc
-            for chunk in self.node_tts.synth(text):
+            for sentence in sentences:
                 if self._force_listen_evt.is_set():
                     break
-                self._emit("audio", text, chunk)
-                if self.play:
-                    if started:
-                        sd.wait()          # chunk N finishes while N+1 was made
-                    sd.play(chunk, TTS_RATE)
+                self._last_spoken = f"{self._last_spoken} {sentence}".strip()
+                for chunk in self._sound_of(sentence):
+                    if self._force_listen_evt.is_set():
+                        break
+                    self._first_audio()
+                    self._emit("audio", sentence, chunk)
+                    for out in self.outputs:
+                        out.play(chunk, rate)
                     started = True
-            if started and self.play:
-                sd.wait()
+            if started and self.outputs:
+                for out in self.outputs:
+                    out.wait()
                 time.sleep(0.12)           # let the speaker and the room drain
         finally:
             self._in_speech = False
@@ -1025,6 +1236,7 @@ class GemmaMultimodal:
         """Stop owned workers/devices and close the injected runtime."""
         self._ear_stop.set()
         self._preview_stop.set()
+        self._decoder.shutdown(wait=False)
         if self._ear_thread is not None:
             self._ear_thread.join(timeout=1.0)
         if self._preview_thread is not None:

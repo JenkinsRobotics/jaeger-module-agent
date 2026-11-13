@@ -259,6 +259,12 @@ SILERO_OPEN_P = 0.30         # high-precision admission: false wakes cost most
 
 SILERO_CLOSE_P = 0.125       # once admitted, retain quiet syllables/consonants
 
+EARLY_DECODE_MS = 200         # hearing starts on the phrase this far into the
+                              # silence, so its answer is ready when the
+                              # endpoint below confirms the turn; thrown away
+                              # if the person keeps talking. The endpoint
+                              # itself does not move. 0 turns it off.
+
 SILENCE_HANGOVER_MS = 500     # FAMILY CONTRACT (2026-09-01): fast endpoint;
                               # HOLDING absorbs thinking pauses at the REPLY
                               # level instead of a slow endpoint taxing every
@@ -444,6 +450,7 @@ __all__ = [
     "SILERO_OPEN_P",
     "SILERO_CLOSE_P",
     "SILENCE_HANGOVER_MS",
+    "EARLY_DECODE_MS",
     "MIN_SPEECH_MS",
     "HARD_MAX_SPEECH_MS",
     "SYSTEM_PROMPT",

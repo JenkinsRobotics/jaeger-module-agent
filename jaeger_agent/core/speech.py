@@ -66,22 +66,28 @@ class SpeechRuntime:
         self.load()
         return str(self.stt.transcribe(samples)).strip()
 
-    def transcribe_segments(self, audio: Any, **options: Any) -> list[dict[str, Any]]:
-        """Preserve Whisper timestamps and decode options for incremental STT.
+    def transcribe_segments(self, audio: Any, *, language: str = "en",
+                            initial_prompt: str | None = None,
+                            abort_callback: Any = None) -> list[dict[str, Any]]:
+        """Timestamped segments for a host's incremental STT.
 
-        The node's lock is the authoritative decode lock for all faces,
-        including previews and whole-utterance transcription.
+        ``t0``/``t1`` are centiseconds.  The node's lock is the authoritative
+        decode lock for all faces, including previews and whole utterances.
         """
         self.load()
         with self.stt._lock:
             segments = self.stt.model.transcribe(
                 np.asarray(audio, dtype=np.float32).reshape(-1),
-                **{"language": "en", **options},
-            )
+                language=language, prompt=initial_prompt, abort=abort_callback)
             return [
-                {"text": str(s.text), "t0": int(s.t0), "t1": int(s.t1)}
+                {"text": str(s.text), "t0": s.start_ms // 10, "t1": s.end_ms // 10}
                 for s in segments
             ]
+
+    def status(self) -> dict[str, dict[str, str]]:
+        """Which module, version, model and compute each part runs on."""
+        self.load()
+        return {"voice": dict(self.tts.info), "hearing": dict(self.stt.info)}
 
     def synthesize_stream(self, text: str) -> Iterator[np.ndarray]:
         """Yield each Kokoro chunk immediately, without buffering the reply."""
@@ -121,6 +127,7 @@ class SpeechRuntime:
 
             played = False
             stream = None
+            rate = getattr(self.tts, "sample_rate", TTS_RATE)
             try:
                 for chunk in self.synthesize_stream(text):
                     if is_cancelled():
@@ -128,12 +135,13 @@ class SpeechRuntime:
                     if not len(chunk):
                         continue
                     if stream is None:
-                        stream = sd.OutputStream(samplerate=TTS_RATE, channels=1,
-                                                 dtype="float32", latency="low")
+                        stream = sd.OutputStream(
+                            samplerate=rate, channels=1, dtype="float32",
+                            latency="low", device=self.config.output_device)
                         stream.start()
                     # At most 20 ms of PCM per write, so device buffering does
                     # not turn a long sentence into an uninterruptible wait.
-                    block = max(1, TTS_RATE // 50)
+                    block = max(1, rate // 50)
                     for offset in range(0, len(chunk), block):
                         if is_cancelled():
                             return False

@@ -63,8 +63,9 @@ seam exists, the agent can run the corpus that measures it.
 
 **Architectural, not a rename**
 
-`tools/listen.py` loads `pywhispercpp` **in-process** rather than going
-through the `stt` slot's node, and imports `jaeger_ai.main` for
+`tools/listen.py` now hears through whatever module fills the `stt` slot
+(`core/parts.py`, `open_hearing`), with no loader of its own, but still
+**in-process** rather than through the slot's bus node, and it imports `jaeger_ai.main` for
 `voice_warm_status`. The TTS path took the 0.4 rewire — `speak()`
 publishes `SpeechCommand` and waits for `SpokenAck` — and hearing never
 did.

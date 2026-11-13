@@ -14,5 +14,5 @@
   "status": "verified_2026-09-02",
   "implementation": "runtime.py:build",
   "lineage": "gemma_multimodal-decomposition",
-  "notes": "Kokoro af_heart at native 24 kHz; playback device + barge policy belong to the audio nodes."
+  "notes": "Speaks through the Jaeger module filling the tts slot (jaeger-kokoro-tts today, af_heart at native 24 kHz); no loader of its own. Playback device + barge policy belong to the audio nodes."
 }

@@ -74,16 +74,17 @@ image_gen = ["diffusers>=0.30", "torch>=2", "pillow>=10"]
 # The verified VoiceLLM-derived perception/speech pipeline.  These remain
 # optional because the implementation is lazy: a headless text agent must not
 # import or install neural audio runtimes merely to use the agent loop.
+# Voice and hearing are the Jaeger modules (whatever fills the tts and stt
+# slots); the agent carries no speech loader of its own.  Like jaeger-os,
+# the modules are version specs: they are not on PyPI yet, so install them
+# from their repos first (jaeger-module-kokoro, jaeger-module-whisper).
 multimodal = [
     "numpy>=1.26",
     "scipy>=1.11",
     "sounddevice>=0.4.6",
     "soundfile>=0.12",
-    "pywhispercpp>=1.2",
-    "kokoro>=0.9.4",
-    # Misaki English needs this model at startup; install it with the extra
-    # instead of attempting a package download in the audio worker thread.
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85",
+    "jaeger-kokoro-tts>=0.13",
+    "jaeger-whisper-stt>=0.14",
     "onnxruntime>=1.17",
 ]
 
@@ -94,11 +95,8 @@ audio = [
     "scipy>=1.11",
     "sounddevice>=0.4.6",
     "soundfile>=0.12",
-    "pywhispercpp>=1.2",
-    "kokoro>=0.9.4",
-    # Misaki English needs this model at startup; install it with the extra
-    # instead of attempting a package download in the audio worker thread.
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85",
+    "jaeger-kokoro-tts>=0.13",
+    "jaeger-whisper-stt>=0.14",
     "onnxruntime>=1.17",
 ]
 
@@ -109,11 +107,8 @@ multimodal-duplex = [
     "scipy>=1.11",
     "sounddevice>=0.4.6",
     "soundfile>=0.12",
-    "pywhispercpp>=1.2",
-    "kokoro>=0.9.4",
-    # Misaki English needs this model at startup; install it with the extra
-    # instead of attempting a package download in the audio worker thread.
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85",
+    "jaeger-kokoro-tts>=0.13",
+    "jaeger-whisper-stt>=0.14",
     "onnxruntime>=1.17",
     "pyaec>=1.0.1",
 ]
