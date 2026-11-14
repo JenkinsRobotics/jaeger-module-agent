@@ -649,6 +649,17 @@ Where the boundary holds:
   An app with an open microphone and no wake word sets
   `MultimodalConfig(wake_required=False)`; `engine.switch_session(key, prompt)`
   changes character, each key keeping its own conversation.
+  An app that plays the sound itself, through a microphone with an echo
+  canceller (a browser's), opens the mic: `half_duplex=False`. `push_audio`
+  then comes straight back, each heard turn runs on a thread of its own, and
+  a phrase said over a reply cuts that reply (`BARGE_MODE`). One turn has
+  the floor at a time, and every turn (typed, heard or a scene) ends with a
+  `("turn", "end")` event: after everything else it emits, before the next
+  turn's words. When the app itself stops the sound (a mic it closed, or
+  gated while the agent talks) it says so with `end_phrase()`, since the
+  quiet that ends a phrase will not come. A reply cut at a token keeps what
+  the model has read (`adapters/local_llama.py`); only a decode still running
+  when the wait for it ran out resets the model, as a stall does.
 - The instance layout is **injected**, not fetched: `workspace.bind(layout)`
   wires all tool I/O to a host-chosen directory at startup, and the
   `InstanceLayout` type import is `TYPE_CHECKING` only.

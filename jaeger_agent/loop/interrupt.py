@@ -40,7 +40,13 @@ T = TypeVar("T")
 class AgentInterrupted(Exception):
     """Raised by :func:`interruptible_call` when the interrupt event
     fires before the wrapped call returns. Carries the agent up out of
-    the loop so ``JaegerAgent.run_turn`` can bail cleanly."""
+    the loop so ``JaegerAgent.run_turn`` can bail cleanly.
+
+    ``worker_finished``: the wrapped call had stopped by the time this was
+    raised (it noticed the interrupt, or the abort signal, and returned).
+    False means it was still running when the wait for it ran out."""
+
+    worker_finished = False
 
 
 class StaleCallTimeout(Exception):
@@ -200,6 +206,8 @@ def interruptible_call(
             # inside the generation) stops it; drain so the pinned thread is
             # free for the next call.
             _wait(stale_timeout if stale_timeout else 30.0)
+        if isinstance(exc, AgentInterrupted):
+            exc.worker_finished = not _is_running()
         raise exc
 
     while _is_running():
@@ -226,6 +234,8 @@ def interruptible_call(
         _wait(poll_interval)
 
     if "error" in box:
+        if isinstance(box["error"], AgentInterrupted):
+            box["error"].worker_finished = True     # it stopped itself
         raise box["error"]
     return box["value"]  # type: ignore[no-any-return]
 

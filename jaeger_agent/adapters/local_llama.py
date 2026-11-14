@@ -836,13 +836,25 @@ class LocalLlamaAdapter(OpenAIAdapter):
             if self._progress.first is not None:
                 self.last_ttft_s = max(0.0, self._progress.first - started)
             return out
-        except (StaleCallTimeout, AgentInterrupted):
-            # The decode was aborted mid-generation. Even after the
-            # worker stops, llama-cpp's internal batch/KV state is left
+        except StaleCallTimeout:
+            # The decode stalled and was aborted. Even after the worker
+            # stops, llama-cpp's internal batch/KV state is left
             # crash-prone — the NEXT decode segfaults the process (the
             # 2026-05-28 Hermes-3 full-corpus crash at case 8). Reset the
             # context so the next case starts from a clean slate.
             self._reset_after_abort()
+            raise
+        except AgentInterrupted as exc:
+            # Someone cut in. A decode that stopped at a token before we
+            # returned leaves the model as any finished reply does: what
+            # it has read stays good, and the next turn reads on from
+            # there. Resetting here cost the whole prompt again on the
+            # turn after every interruption (about 10 s where a reply
+            # starts in under 1 s; measured 2026-11-13, 12 cuts each
+            # way). A decode still running when the wait ran out is in an
+            # unknown state: reset, as for a stall.
+            if not exc.worker_finished:
+                self._reset_after_abort()
             raise
 
     def _reset_after_abort(self) -> None:

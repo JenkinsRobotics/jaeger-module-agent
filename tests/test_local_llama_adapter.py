@@ -856,10 +856,13 @@ def test_in_process_call_honours_caller_interrupt_event():
     }
 
 
-def test_interrupt_mid_decode_aborts_cooperatively_and_resets():
+def test_interrupt_mid_decode_aborts_cooperatively_and_keeps_what_was_read():
     """End-to-end: an interrupt that fires while the decode is running
-    stops the generation at the next token (via the abort flag), the
-    context is reset, and AgentInterrupted reaches the caller."""
+    stops the generation at the next token (via the abort flag) and
+    AgentInterrupted reaches the caller. The decode stopped at a token,
+    so the context is NOT reset: cutting in is part of a conversation,
+    and the next reply must not start by reading the whole prompt again
+    (about ten seconds on a laptop, where a reply starts in under one)."""
     import threading
     import time as _time
 
@@ -900,7 +903,7 @@ def test_interrupt_mid_decode_aborts_cooperatively_and_resets():
     # The 2000×5ms spin would run ~10s to completion; the barge-in must
     # cut it short within the poll+join budget.
     assert elapsed < 3.0
-    assert llama.resets >= 1
+    assert llama.resets == 0
 
 
 def test_call_does_not_mutate_input_messages():
@@ -1050,9 +1053,9 @@ def test_reasoning_model_does_not_stream_its_thinking():
     assert fake.last_chat_kwargs["stream"] is False
 
 
-def test_interrupt_mid_stream_raises_and_resets_the_model():
-    """A barge-in while text is streaming stops the turn and leaves the
-    shared model clean for the next one."""
+def test_interrupt_mid_stream_raises_and_keeps_what_the_model_has_read():
+    """A barge-in while text is streaming stops the turn between chunks.
+    The model is left as a finished reply leaves it, not reset."""
     ev = threading.Event()
 
     class _Talker:
@@ -1073,7 +1076,7 @@ def test_interrupt_mid_stream_raises_and_resets_the_model():
     with pytest.raises(AgentInterrupted):
         a.call({"model": "x", "messages": []}, ev, on_delta=pieces.append)
     assert pieces == ["one "]
-    assert _Talker.resets >= 1
+    assert _Talker.resets == 0
 
 
 def test_tool_call_example_is_written_in_the_loaded_models_own_call_form():
@@ -1187,3 +1190,45 @@ def test_the_thinking_toggle_prompt_carries_tool_results_the_same_way():
         {"role": "tool", "tool_call_id": "c1", "content": '{"time": "noon"}'},
     ], [], "")
     assert kw["_thinking_prompt"] == "|user:What time is it?|assistant:response:get_time |T"
+
+
+# ── a cut reply: what the model has read ───────────────────────────
+
+class _SlowLlama:
+    """Its reply runs until the adapter's abort check stops it at a token
+    (``stops``), or for three seconds whatever it is told."""
+
+    def __init__(self, stops: bool) -> None:
+        import threading
+        self.stops, self.resets, self.started = stops, 0, threading.Event()
+
+    def create_chat_completion(self, **kwargs: Any) -> Any:
+        import time
+        check = kwargs["logits_processor"][0]
+        self.started.set()
+        for _ in range(300):
+            time.sleep(0.01)
+            if self.stops:
+                try:
+                    check(None, None)          # once a token, as llama-cpp calls it
+                except Exception:
+                    return _mk_response("cut")
+        return _mk_response("late")
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+def _cut(llama: _SlowLlama) -> int:
+    """Interrupt a reply that is being written; how often the model was reset."""
+    import threading
+    adapter, cut = LocalLlamaAdapter(llama=llama), threading.Event()
+    threading.Thread(target=lambda: (llama.started.wait(2), cut.set()), daemon=True).start()
+    with pytest.raises(AgentInterrupted):
+        adapter.call({"model": "x", "messages": []}, cut, stale_timeout=None)
+    return llama.resets
+
+
+def test_a_reply_that_did_not_stop_in_time_still_resets_the_model():
+    """Still decoding when the wait for it ran out: its state is not known."""
+    assert _cut(_SlowLlama(stops=False)) == 1

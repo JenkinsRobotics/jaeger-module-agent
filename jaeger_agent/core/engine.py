@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -356,6 +357,10 @@ class GemmaMultimodal:
         # lock, so a typed message during duplex speech serializes instead
         # of racing the LLM
         self._respond_lock = threading.Lock()
+        # One turn has the floor, from its words to its end. With an open mic
+        # (half_duplex=False) turns come from more than one thread; this is
+        # what keeps their events, the voice and the session apart.
+        self._floor = threading.Lock()
         self._staged = None               # a scene a tool staged in this turn
         self._turn_t0: float | None = None   # for the "First audio" latency
         self._mode_lock = threading.Lock()
@@ -366,6 +371,27 @@ class GemmaMultimodal:
     # -- events ------------------------------------------------------------
     def _emit(self, kind: str, text: str = "", data=None) -> None:
         self.on_event(Event(kind, text, data))
+
+    @contextmanager
+    def _turn(self, cut: bool = False):
+        """One turn has the floor from its words to its end, and says when it
+        is over: ``("turn", "end")``, after everything else it emits and before
+        the next turn's words. ``cut``: a reply that is on its way gives way to
+        this turn first (BARGE_MODE "stop"), as it does to a voice over it."""
+        if (cut and dxr.BARGE_MODE == "stop"
+                and (self._floor.locked() or self._respond_lock.locked())):
+            self.force_listen()
+        with self._floor:
+            try:
+                yield
+            except Exception as exc:
+                # said before the turn is over, so whoever shows the turn can
+                # show that it failed
+                self._emit("status", f"error: {exc}")
+                exc.told = True
+                raise
+            finally:
+                self._emit("turn", "end")
 
     # -- startup -----------------------------------------------------------
     def load(self) -> None:
@@ -490,11 +516,12 @@ class GemmaMultimodal:
             return
         if self.speaking.is_set() and dxr.BARGE_MODE == "stop":
             self.force_listen()
-        self._emit("user", text)
-        if closes_conversation(text):
-            self._dismiss()
-            return
-        self._respond(text, input_modality="text")
+        with self._turn(cut=not self.half_duplex):
+            self._emit("user", text)
+            if closes_conversation(text):
+                self._dismiss()
+                return
+            self._respond(text, input_modality="text")
 
     # -- input 2: vision ---------------------------------------------------
     def attach_image(self, data_uri: str) -> None:
@@ -567,14 +594,48 @@ class GemmaMultimodal:
             self._early = (self._decoder.submit(
                 self.node_stt.transcribe, np.concatenate(self._frames),
                 abort=unwanted.is_set), unwanted)
-        if not (self._voiced >= self._minb and self._silent >= self._hang):
-            return
+        if self._voiced >= self._minb and self._silent >= self._hang:
+            self._finish_phrase()
+
+    def _finish_phrase(self) -> None:
+        """The phrase is over: on to the five stages. A closed mic answers it
+        here, before it takes another frame. An open one gives the turn a
+        thread of its own and goes on hearing, so a person can cut in."""
         audio = np.concatenate(self._frames)
         self._in_speech = False
         self._frames = []
         self._voiced = self._silent = 0
         early, self._early = self._early, None
-        self._on_turn(audio, early[0] if early else None)
+        early = early[0] if early else None
+        if self.half_duplex:
+            return self._on_turn(audio, early)
+        threading.Thread(target=self._heard, args=(audio, early),
+                         daemon=True, name="heard-turn").start()
+
+    def _heard(self, audio: np.ndarray, early) -> None:
+        try:
+            self._on_turn(audio, early)
+        except Exception as exc:          # nobody is waiting on this thread
+            if not getattr(exc, "told", False):
+                self._emit("status", f"error: {exc}")
+
+    def end_phrase(self) -> None:
+        """Whoever feeds :meth:`push_audio` says the sound has stopped: a mic
+        that was closed, or gated while the agent talks. A phrase that is
+        forming ends here, instead of waiting for a quiet that will not come.
+        Call it from the thread that pushes the sound."""
+        if not self._in_speech:
+            return
+        if self._voiced >= self._minb:
+            return self._finish_phrase()
+        if self._early is not None:       # too short to be a phrase
+            self._early[0].cancel()
+            self._early[1].set()
+            self._early = None
+        self._in_speech = False
+        self._frames = []
+        self._voiced = self._silent = 0
+        self._preview_decoded = 0
 
     # -- the five stages ---------------------------------------------------
     def _on_turn(self, audio: np.ndarray, early=None) -> None:
@@ -587,7 +648,7 @@ class GemmaMultimodal:
         self._preview_decoded = 0
         heard = early.result() if early is not None else self.node_stt.transcribe(audio)
         if not heard:
-            self._emit("state", "listening")
+            self._emit("state", "no words — ignored")
             return
         self._emit("live", heard)
 
@@ -661,12 +722,14 @@ class GemmaMultimodal:
         if self._hold["text"]:
             command = (self._hold["text"] + " " + command).strip()
             self._hold = {"text": "", "deadline": 0.0, "turns": []}
-        self._emit("user", committed_user_text(heard, command))
-        self._emit("live", "")
-        if closes_conversation(command):    # conversation is a state
-            self._dismiss()
-            return
-        self._respond(command, t_end, turns=turns)
+        # An open mic: the reply this was said over gives way first.
+        with self._turn(cut=not self.half_duplex):
+            self._emit("user", committed_user_text(heard, command))
+            self._emit("live", "")
+            if closes_conversation(command):    # conversation is a state
+                self._dismiss()
+                return
+            self._respond(command, t_end, turns=turns)
 
     def _respond(
         self,
@@ -825,9 +888,10 @@ class GemmaMultimodal:
         if self._hold["text"] and time.time() >= self._hold["deadline"]:
             text, turns = self._hold["text"], self._hold["turns"]
             self._hold = {"text": "", "deadline": 0.0, "turns": []}
-            self._emit("user", text)
-            self._emit("live", "")
-            self._respond(text, turns=turns)
+            with self._turn():
+                self._emit("user", text)
+                self._emit("live", "")
+                self._respond(text, turns=turns)
 
     def _dismiss(self) -> None:
         """Speak goodbye, then clear state and re-arm the wake gate."""
@@ -892,11 +956,12 @@ class GemmaMultimodal:
         is the character's voice in the loaded voice module; left out, the
         voice stays as it is.
         """
-        if voice:
-            self.node_tts.set_voice(voice)
-        self.extra_prompt = extra_prompt.strip()
-        self.node_llm.switch(session_key)
-        self.node_llm.load(None, self._say, system_prompt=self._system_prompt())
+        with self._floor:                 # never under a turn that is on its way
+            if voice:
+                self.node_tts.set_voice(voice)
+            self.extra_prompt = extra_prompt.strip()
+            self.node_llm.switch(session_key)
+            self.node_llm.load(None, self._say, system_prompt=self._system_prompt())
 
     # -- what an app needs without reaching into the nodes ------------------
     @property
@@ -907,8 +972,10 @@ class GemmaMultimodal:
     def synth(self, text: str, *, voice: str | None = None):
         """One line through the voice alone — no model, no turn, no events.
         Yields the voice module's chunks (sound, with ``marks`` for the lips),
-        in the set voice or, for this line, in ``voice``."""
-        yield from self.node_tts.synth(text, **({"voice": voice} if voice else {}))
+        in the set voice or, for this line, in ``voice``. It waits for a turn
+        that is on its way: the voice makes one sound at a time."""
+        with self._floor:
+            yield from self.node_tts.synth(text, **({"voice": voice} if voice else {}))
 
     def perform(self, script, fit=None) -> None:
         """Perform a scene (:mod:`.scene`): its lines in the agent's own voice,
@@ -919,7 +986,7 @@ class GemmaMultimodal:
         :func:`.scene.lines`): it may leave parts out, or refuse the scene."""
         lines = scene.lines(script, fit)
         said = " ".join(line for line in lines if line)
-        with self._respond_lock:
+        with self._turn(), self._respond_lock:
             self._force_listen_evt.clear()
             self._emit("state", "speaking")
             self._speak_scene(lines)
@@ -1087,11 +1154,12 @@ class GemmaMultimodal:
                 turns[-1]["wake"] = wake[0]
             self._agg.clear()
             self._emit("live", "")
-            self._emit("user", utt)
-            if closes_conversation(utt):
-                self._dismiss()
-                continue
-            self._respond(utt, turns=turns)
+            with self._turn():
+                self._emit("user", utt)
+                if closes_conversation(utt):
+                    self._dismiss()
+                    continue
+                self._respond(utt, turns=turns)
 
     def _first_audio(self) -> None:
         if self._turn_t0 is not None:
@@ -1204,7 +1272,8 @@ class GemmaMultimodal:
         self._last_spoken = ""
         self._last_spoken_at = time.time()
         self.speaking.set()
-        self.drain_input()
+        if self.half_duplex:
+            self.drain_input()
         started = False
         rate = getattr(self.node_tts, "sample_rate", TTS_RATE)
         try:
@@ -1225,10 +1294,11 @@ class GemmaMultimodal:
                     out.wait()
                 time.sleep(0.12)           # let the speaker and the room drain
         finally:
-            self._in_speech = False
-            self._frames = []
-            self._residue = np.zeros(0, dtype=np.float32)
-            self.drain_input()
+            if self.half_duplex:          # an open mic may be hearing someone
+                self._in_speech = False
+                self._frames = []
+                self._residue = np.zeros(0, dtype=np.float32)
+                self.drain_input()
             self.speaking.clear()
             self._last_spoken_at = time.time()
 
