@@ -378,11 +378,26 @@ class LoopTest(unittest.TestCase):
         self.assertIn('It can show these feelings: joy, sad. ', odd)       # one name at a time: run together, Gemma took two for one
         self.assertIn('It can make these moves: nod, wave. ', odd); self.assertNotIn('not a name', odd)   # only plain names reach the prompt
         self.assertNotIn('<|', odd); self.assertNotIn('[joy]', odd)        # no model's own syntax and no inline tags: she moves with her tool
+        # Her manner (the character's dials, as rules) is not in this text: it is said with each turn (tests/test_manner.py).
+        self.assertEqual(agent_loop.told({'who': 'You are Vita, an AI character.', 'body': 'Vita', 'offers': offers, 'manner': 'Do not joke.'}), text)
         self.assertEqual(agent_loop.told({'persona': 'You are Mochi.', 'who': 'ignored'}), 'You are Mochi.')
         self.assertEqual(agent_loop.told({}), '')
         self.run_all({'op': 'persona', 'session': 's:vita', 'who': 'You are Vita, an AI character.', 'body': 'Vita', 'offers': offers})
         said = next(c for c in self.engine.calls if c[0] == 'persona')
         self.assertEqual(said[2], text)
+
+    def test_her_manner_is_the_engines_to_say_with_each_turn_and_changes_at_once(self):
+        """A host says how she talks right now with who she is, or on its own line whenever a dial is turned: no new
+        conversation, and nothing for the model to read again."""
+        self.run_all({'op': 'persona', 'session': 's:vita', 'who': 'You are Vita, an AI character.', 'manner': '  Do not joke.  '})
+        self.assertEqual(self.engine.manner, 'Do not joke.')
+        self.loop.receive({'op': 'manner', 'manner': 'Speak formally.'})          # a dial turned: not queued behind a reply
+        self.assertEqual(self.engine.manner, 'Speak formally.')
+        self.assertEqual([c[0] for c in self.engine.calls].count('persona'), 1)  # the conversation goes on
+        self.loop.receive({'op': 'manner', 'manner': 'x' * 900})
+        self.assertEqual(len(self.engine.manner), 600)                           # a host's words go into the prompt: bounded
+        self.run_all({'op': 'persona', 'session': 's:mochi', 'who': 'You are Mochi.'})
+        self.assertEqual(self.engine.manner, '')                                 # another character, who names none
 
     def test_a_character_brings_its_own_voice(self):
         self.loop.extra = {'load_s': 16.9}

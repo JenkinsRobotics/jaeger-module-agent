@@ -125,6 +125,7 @@ def test_the_body_is_whatever_fills_the_animation_slot(monkeypatch) -> None:
     assert "a small companion robot" in first["persona"]          # who she is, as her bundle says
     assert "joy, thinking, listening" in first["persona"] and "wink" in first["persona"]
     assert "avatar tool" in first["persona"]
+    assert "manner" not in first                                  # this bundle names none
 
     device.start()
     try:
@@ -134,6 +135,16 @@ def test_the_body_is_whatever_fills_the_animation_slot(monkeypatch) -> None:
         assert host.sent == [{"op": "cue", "call": {"emotion": "joy"}}]
     finally:
         device.close()
+
+
+def test_a_bundle_that_says_her_manner_has_it_said_with_each_turn(monkeypatch) -> None:
+    class Mannered(Body):
+        character = {**Body.character, "manner": "Never be sarcastic or ironic; mean exactly what you say."}
+
+    fill_slots(monkeypatch, animation=SimpleNamespace(__name__="m", __version__="1", open_body=Mannered))
+    device = Device(Host(), "a/bundle")
+    assert device.first["manner"] == "Never be sarcastic or ironic; mean exactly what you say."   # the engine says it with each turn
+    assert "sarcastic" not in device.first["persona"]
 
 
 def test_with_nothing_in_the_slot_the_agent_is_a_voice_with_no_face(monkeypatch) -> None:

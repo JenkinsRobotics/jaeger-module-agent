@@ -57,6 +57,7 @@ class Device:
         who = who or character.get('who') or f'You are {self.name}, an AI character.'
         if character.get('voice'): start.setdefault('voice', character['voice'])
         if not body: start['body'] = False                   # the agent then offers no avatar or scene tool, and plays its own voice
+        if character.get('manner'): start.setdefault('manner', character['manner'])   # how she talks, as her bundle's dials say it: the agent says it with each turn
         self.first = {'op': 'start', 'persona': persona(who, body.name, body.offers) if body else voice_only(who), 'session': session,
                       'hearing': hearing, **({'workspace': str(workspace)} if workspace else {}), **start}
 

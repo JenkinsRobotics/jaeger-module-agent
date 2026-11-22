@@ -31,10 +31,11 @@ when a part is all voiced, and the host answers {op: played, n} when its speaker
 agent goes on listening (listens_while_thinking), so a person who was only pausing can go on and is answered once, whole.
 The engine says when each turn is over; that is this worker's 'done'.
 
-Who she is comes as {persona: the whole text} or as {who, body, offers}, from which the agent writes the text with its own
-rules for a character in a body (told, persona.py).
+Who she is comes as {persona: the whole text} or as {who, body, offers}, from which the agent writes the text with
+its own rules for a character in a body (told, persona.py). Either may come with {manner}: how she talks right now, as
+short rules. That is not put in the text: the engine says it with each turn, and {op: manner} changes it at any time.
 
-In (one JSON line each): {op: start, ...} first, then {op: text | audio | persona | interrupt | control_result | say | scene | cue | played}.
+In (one JSON line each): {op: start, ...} first, then {op: text | audio | persona | manner | interrupt | control_result | say | scene | cue | played}.
 Out: {ready, schema, model, report}, {event, text, data}, {event: audio, text, rate, pcm, marks, cues}, {event: done}, {control, id},
 {id, rate, pcm, marks, ms} (the answer to say), {report} (after a voice change), {event: scene, text: begin | end} (around a scene's sound), {event: scene, text: refused, data} (a script it could not read),
 {event: voiced, n} (half duplex only), {event: feeling, text} (what the voice is told a line feels like: the feeling the
@@ -76,6 +77,12 @@ def told(r):
     if not r.get('who'): return ''
     from .persona import persona
     return persona(str(r['who']), r.get('body', ''), r.get('offers'))
+
+
+def how(r):
+    """Her manner, from a host's start, persona or manner line: how she talks right now, as short rules. The engine says
+    it with each turn (core/engine.py), so it is not in told(): a dial turned costs no new conversation and no reading."""
+    return str(r.get('manner') or '').strip()[:600]             # a host's words go into the prompt: bounded
 
 
 class Body:
@@ -165,6 +172,7 @@ class Loop:
         elif op == 'audio':                   # heard now, not after the reply on its way: this is how a person goes on, or cuts in
             if r.get('pcm'): self.engine.push_audio(np.frombuffer(base64.b64decode(r['pcm']), '<i2').astype(np.float32) / 32768)
             if r.get('end'): self.engine.end_phrase()   # the page's mic went quiet or was gated: the phrase ends here
+        elif op == 'manner': self.engine.manner = how(r)   # a dial was turned: from her next reply on, in the same conversation
         elif op == 'cue':                     # its moment has come: it cannot wait behind the lines still being voiced
             threading.Thread(target=self.cue, args=(r.get('call'),), daemon=True).start()
         else:
@@ -237,6 +245,7 @@ class Loop:
                 elif op == 'persona':   # who it is now, and (when the app names one) the character's voice in the same voice module
                     voice = r.get('voice')
                     self.engine.switch_session(r['session'], told(r), **({'voice': voice} if voice else {}))
+                    self.engine.manner = how(r)
                     if self.examples: self.engine.prime(self.examples)
                     if voice: self.emit({'report': self.report()})
                 elif op == 'say': self.say(r)
@@ -316,6 +325,7 @@ def main():
                                 **({'kokoro_voice': start['voice']} if start.get('voice') else {})),   # the character's own voice, when the host names one
         runtime_config={**({} if key == DEFAULT_LLM else {'model_path': str(LLMS[key].path)}),   # no path: the agent loads its default
                         **{k: start[k] for k in ('max_tokens', 'temperature', 'timeout_s') if k in start}})
+    engine.manner = how(start)
     engine.load()                                            # on this, the main thread: the MLX voice crashes at exit otherwise
     if loop.examples: engine.prime(loop.examples)            # the conversation it starts in; each later one is shown them as it opens
     loop.extra = {'tool_list': 'every tool' if os.environ.get('JAEGER_FULL_TOOLS') == '1' or os.environ['JAEGER_TOOLSET_SCOPING'] != '1' else 'short list',

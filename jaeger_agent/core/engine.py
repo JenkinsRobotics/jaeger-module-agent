@@ -299,6 +299,10 @@ class GemmaMultimodal:
         self._apart = not half_duplex or listens_while_thinking
         self.want_vision = want_vision
         self.extra_prompt = extra_prompt.strip()
+        # How she talks right now, as short rules. Said with each turn, not in the
+        # system prompt: a small model follows it there, and changing it reads
+        # nothing again (tests/test_manner.py).
+        self.manner = ""
         self.play = play
         # Where the voice goes (see core/audio.py). The app's list wins; with
         # none given it is this machine's speaker. The echo-cancelling modes
@@ -933,6 +937,8 @@ class GemmaMultimodal:
         if self.config.output_mode == "dynamic":
             modality = "text" if input_modality == "text" else "speech"
             user_text = f"[input: {modality}]\n{user_text}"
+        if self.manner:
+            user_text = f"[manner: {self.manner}]\n{user_text}"
         # the exact payload the agent receives — context line and all — so
         # the GUI can show what was SUBMITTED, not just what was heard
         self._emit("submitted",

@@ -42,7 +42,10 @@ def who(character, name):
 
 def persona(who, body='', controls=None):
     """The instructions for one character in one body. who: "You are Mochi, ..."; body: the body's name;
-    controls: what it offers, {emotions, reactions, actions}, as the body itself lists them."""
+    controls: what it offers, {emotions, reactions, actions}, as the body itself lists them.
+    How she talks right now (her manner: a pack's dials as rules) is not here. Measured on gemma-4-E4B, 2026-11-22: in
+    this text several rules at once changed almost nothing, and every change meant a new conversation and the whole
+    prompt read again (11 to 14 s to her next word). The engine says it with each turn (core/engine.py, tests/test_manner.py)."""
     controls = controls if isinstance(controls, dict) else {}
     def names(*keys):
         return ', '.join([n for k in keys for n in (controls.get(k) if isinstance(controls.get(k), list) else []) if isinstance(n, str) and n.isidentifier()][:16])   # one name at a time: run together, Gemma took two for one

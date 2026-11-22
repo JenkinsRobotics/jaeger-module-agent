@@ -793,6 +793,23 @@ Mochi's launcher and the JP01 stand-in all run it, and JaegerAvatar's
 simulated JP01, a typed and three spoken turns in the app, and Mochi's
 scenes.
 
+**Her manner rides on the turn (2026-11-22).** How a character talks right
+now (formal, few words, no jokes: a pack's dials as short rules, or ones a
+person has just turned) is not part of what she is told at the start. The
+engine says it with each turn, as a `[manner: ...]` line before what the user
+said (`GemmaMultimodal.manner`, the way the `[context:]` line travels), and a
+host sets it with its start or persona line or changes it with
+`{op: manner}`. Measured on gemma-4-E4B, same character and asks, typed,
+sound muted, on a loaded machine: in the system prompt, three rules at once
+left replies nearly as they were (23 words a reply became 16; 4 contractions
+in five replies stayed 3 to 4), and every change needed a new conversation,
+whose first reply took 11 to 14 s (the prompt and tool list read again). With
+the turn, the same rules were followed (7 words a reply, no contractions, no
+exclamation marks), changed in the middle of a conversation, and the avatar
+tool was called on 48 of 48 turns; time to the first token was the same with
+four rules and with six (0.4 to 0.7 s). Not run: spoken turns, where the line
+sits before the `[context:]` line. Test: `tests/test_manner.py`.
+
 ---
 
 ## 9. Verifying it
