@@ -34,7 +34,8 @@ The engine says when each turn is over; that is this worker's 'done'.
 In (one JSON line each): {op: start, ...} first, then {op: text | audio | persona | interrupt | control_result | say | scene | cue | played}.
 Out: {ready, schema, model, report}, {event, text, data}, {event: audio, text, rate, pcm, marks, cues}, {event: done}, {control, id},
 {id, rate, pcm, marks, ms} (the answer to say), {report} (after a voice change), {event: scene, text: begin | end} (around a scene's sound), {event: scene, text: refused, data} (a script it could not read),
-{event: voiced, n} (half duplex only).
+{event: voiced, n} (half duplex only), {event: feeling, text} (what the voice is told a line feels like: the feeling the
+model's avatar call set on the body, or a scene's).
 """
 import base64
 import json
@@ -127,6 +128,13 @@ class Loop:
         except queue.Empty: answer = {'ok': False, 'error': 'The avatar did not answer'}
         finally: self.waiting.pop(rid, None)
         self.emit({'event': 'tool', 'text': f'avatar {op}', 'data': {'value': value, 'result': answer}})   # shown in the Data flow window
+        return answer
+
+    def felt(self, op, value, ttl_ms):
+        """The model's own avatar call: the body is asked, and a feeling it took is told to the voice too, so a voice that
+        can act on it sounds as the face looks. (A scene's lines are voiced with their feelings by the engine itself.)"""
+        answer = self.control(op, value, ttl_ms)
+        if op == 'emotion' and answer.get('ok'): self.engine.feel(value)
         return answer
 
     def receive(self, r):
@@ -275,7 +283,7 @@ def main():
     loop = Loop(emit)
     faced = start.get('body', True) is not False             # false: nothing fills the animation slot for this host
     if faced:
-        register_tool_from_function(avatar_tool(loop.control), name='avatar', side_effect='gesture')   # the agent ends the turn on words + a gesture
+        register_tool_from_function(avatar_tool(loop.felt), name='avatar', side_effect='gesture')   # the agent ends the turn on words + a gesture
         register_tool_from_function(scene_tool(loop.stage), name='scene', side_effect='performance')   # the scene is the reply: no second model call to narrate it
     else: loop.examples = []                                 # the examples open with an avatar call: not for a voice with no face
     began = time.time()

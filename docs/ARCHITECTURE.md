@@ -732,6 +732,19 @@ Where the boundary holds:
   too short to be a phrase is let go after the quiet (left open it took in
   all the quiet up to the next phrase, and hearing made "Thank you." out of
   it). `tests/test_open_mic.py` has each.
+  **The voice is told how a line feels** (2026-11-22). `engine.feel(name)`
+  sets the feeling for the rest of the turn and emits `("feeling", name)`; a
+  body's `avatar` tool calls it when the body has taken an emotion
+  (`body/loop.py` `felt`), and a scene's `emotion` step before a line sets it
+  for that line and the ones after. Each line then goes to the voice as
+  `synth(text, feeling=name)` when the module's `synth` has a `feeling`
+  parameter, and as `synth(text)` when it has not, so the Kokoro module is
+  asked exactly as before. The name is the body's own word ("joy", "sad");
+  what it sounds like is the voice module's and the character's business.
+  Short clips are kept by feeling too. `tests/test_feeling.py`. Run live with
+  Kokoro (which takes no feeling): the feeling was set before the lines of
+  two replies and a scene, and nothing else changed. No voice that acts on
+  it exists yet.
 - The instance layout is **injected**, not fetched: `workspace.bind(layout)`
   wires all tool I/O to a host-chosen directory at startup, and the
   `InstanceLayout` type import is `TYPE_CHECKING` only.

@@ -186,6 +186,28 @@ def test_her_voice_goes_to_the_bodys_player_and_the_agent_hears_when_it_has_play
         device.close()
 
 
+def test_a_feeling_the_body_took_from_the_model_is_told_to_the_voice_too() -> None:
+    import threading
+
+    out, felt = [], []
+    made = body_loop.Loop(out.append)
+    made.engine = SimpleNamespace(feel=felt.append)
+
+    def answer(result):                       # the host's side: answer the control the worker sends
+        def run():
+            for _ in range(300):
+                for line in list(out):
+                    if "control" in line and line["id"] in made.waiting:
+                        made.receive({"op": "control_result", "id": line["id"], "result": result})
+                time.sleep(0.01)
+        threading.Thread(target=run, daemon=True).start()
+
+    answer({"ok": True})
+    assert made.felt("emotion", "joy", 10000) == {"ok": True}     # the model's own avatar call
+    assert made.control("emotion", "sad", 10000) == {"ok": True}  # a scene's move at its moment: its line was voiced with it already
+    assert felt == ["joy"]
+
+
 def test_with_a_body_each_conversation_opens_with_an_avatar_call() -> None:
     made = body_loop.Loop(lambda line: None)
     assert made.examples and made.examples[0][2][0][0] == "avatar"   # main() empties this for a host with no body

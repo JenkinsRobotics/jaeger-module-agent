@@ -388,6 +388,7 @@ class GemmaMultimodal:
         self._scene_expect = ""           # the line they are expected to say
         self._scene_from = 0.0            # when her own part will have been played (time.monotonic)
         self._sounded = 0.0               # seconds of sound this turn has put out
+        self._feeling = ""                # how she feels this turn: the voice is told with each line
         self._answering = ""              # what was heard and is being answered now
         self._carry: list = []            # the sound of what they had said when they went on talking: heard with what they say next
         self._joining = False             # an answer they went on over is being dropped: its sound is on its way to _carry
@@ -416,6 +417,7 @@ class GemmaMultimodal:
             self.force_listen()
         with self._floor:
             self._sounded = 0.0
+            self._feeling = ""
             try:
                 yield
             except Exception as exc:
@@ -1245,12 +1247,30 @@ class GemmaMultimodal:
         self._speak(lines)
         self._emit("scene", "end")
 
+    def feel(self, feeling: str) -> None:
+        """How she feels, for the rest of this turn. A body's tool says it when
+        the body has taken the feeling, and the voice is told with every line
+        after, so a voice that can act on it sounds as the face looks."""
+        self._feeling = str(feeling or "")
+        self._emit("feeling", self._feeling)
+
+    def _voice(self, text: str):
+        """The line from the voice, with the feeling when the voice has a
+        place for one."""
+        synth = self.node_tts.synth
+        if self._feeling and "feeling" in inspect.signature(synth).parameters:
+            return synth(text, feeling=self._feeling)
+        return synth(text)
+
     def _sound_of(self, line):
         """A line's sound from the voice, chunk by chunk; a scene's line whole,
         with its cues on it."""
         if isinstance(line, scene.Line):
-            return scene.voiced(line, self.node_tts.synth, self.sample_rate)
-        return self.node_tts.synth(line)
+            for cue in line.cues:             # a feeling set before the line is the line's; one put on a word is a move
+                if cue.get("emotion") and not cue.get("on"):
+                    self.feel(cue["emotion"])
+            return scene.voiced(line, self._voice, self.sample_rate)
+        return self._voice(line)
 
     def call_example(self, name: str, args: dict) -> str:
         """One call of tool ``name`` the way the loaded model writes its calls,
