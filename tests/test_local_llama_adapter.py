@@ -1232,3 +1232,72 @@ def _cut(llama: _SlowLlama) -> int:
 def test_a_reply_that_did_not_stop_in_time_still_resets_the_model():
     """Still decoding when the wait for it ran out: its state is not known."""
     assert _cut(_SlowLlama(stops=False)) == 1
+
+
+def test_a_decode_that_failed_resets_the_model_for_the_next_turn():
+    """``llama_decode`` failing (a compute failure on the GPU) leaves what the
+    model has read unusable: every later turn failed the same way until a
+    restart (2026-11-22, on a machine out of memory). This turn still fails;
+    the next one starts clean."""
+    import threading
+
+    class Broken(_SlowLlama):
+        def create_chat_completion(self, **kwargs: Any) -> Any:
+            raise RuntimeError("llama_decode returned -3")
+
+    llama = Broken(stops=True)
+    adapter = LocalLlamaAdapter(llama=llama)
+    with pytest.raises(RuntimeError, match="llama_decode"):
+        adapter.call({"model": "x", "messages": []}, threading.Event(), stale_timeout=None)
+    assert llama.resets == 1
+
+    class Other(_SlowLlama):
+        def create_chat_completion(self, **kwargs: Any) -> Any:
+            raise RuntimeError("no such template")
+
+    other = Other(stops=True)
+    with pytest.raises(RuntimeError, match="template"):
+        LocalLlamaAdapter(llama=other).call({"model": "x", "messages": []}, threading.Event(), stale_timeout=None)
+    assert other.resets == 0                    # another failure says nothing about what was read
+
+
+# ── a runaway answer ───────────────────────────────────────────────
+
+def test_a_tool_call_that_never_closed_is_not_part_of_the_words():
+    cut = ('Okay, a show!\n\n<|tool_call>call:scene{script:<|"|>emotion joy, action clap: ' + "✨" * 40)
+    a = LocalLlamaAdapter(llama=_FakeLlama(_mk_response("x")))
+    message = a.parse_response({"choices": [{"message": {"content": cut}, "finish_reason": "length"}]})
+    assert message.get("content") == "Okay, a show!"                 # never shown, never spoken, never "continued"
+    assert not message.get("tool_calls")
+    assert message.get("finish_reason") == "tool_call_cut"
+
+    whole = '<|tool_call>call:avatar{emotion:<|"|>joy<|"|>}<tool_call|>Hi there!'
+    message = a.parse_response({"choices": [{"message": {"content": whole}, "finish_reason": "stop"}]})
+    assert [c["name"] for c in message["tool_calls"]] == ["avatar"] and message.get("finish_reason") == "stop"
+    plain = a.parse_response({"choices": [{"message": {"content": "3 < 5, and that is that."}, "finish_reason": "stop"}]})
+    assert plain.get("content") == "3 < 5, and that is that." and plain.get("finish_reason") == "stop"
+
+
+def test_a_stream_that_repeats_one_thing_over_and_over_is_stopped():
+    from jaeger_agent.adapters.openai import _aggregate_chat_stream
+    from jaeger_agent.loop.interrupt import CallProgress
+
+    taken = []
+
+    def chunks(text_pieces):
+        for piece in text_pieces:
+            taken.append(piece)
+            yield {"choices": [{"delta": {"content": piece}, "finish_reason": None}]}
+
+    heard: list[str] = []
+    out = _aggregate_chat_stream(chunks(["Here we go: "] + ["✨"] * 500), threading.Event(), CallProgress(), heard.append)
+    said = out["choices"][0]["message"]["content"]
+    assert said.startswith("Here we go: ") and said.count("✨") <= 3     # the run is cut back, not kept
+    assert out["choices"][0]["finish_reason"] == "repetition"
+    assert len(taken) < 60                                                   # and the model was stopped, not left to fill its limit
+
+    taken.clear()
+    table = _aggregate_chat_stream(chunks(["| a | b |\n", "|" + "-" * 60 + "|\n", "| 1 | 2 |\n"]), threading.Event(), CallProgress(), None)
+    assert "-" * 60 in table["choices"][0]["message"]["content"]             # a ruled line is not a runaway
+    laugh = _aggregate_chat_stream(chunks(["Ha ha ha ha! That is funny. "]), threading.Event(), CallProgress(), None)
+    assert laugh["choices"][0]["finish_reason"] != "repetition"

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
 from jaeger_agent.core import scene
+from jaeger_agent.core.config import MultimodalConfig
 from jaeger_agent.core.engine import GemmaMultimodal
 
 SCRIPT = """
@@ -44,6 +47,8 @@ def test_a_script_is_steps_in_order_and_a_move_rides_on_what_comes_next() -> Non
     ("emotion excited, action spin | say Watch this, everyone! | emotion joy, action bow | say Bye!",   # two moves in one step, by a comma
      [{"say": "Watch this, everyone!", "cues": [{"emotion": "excited", "action": "spin"}]},
       {"say": "Bye!", "cues": [{"emotion": "joy", "action": "bow"}]}]),
+    ("emotion excited | hop | say One! | wait 1 | hop | say Two!",                      # a move named bare, as Gemma writes it (3 of 4 runs, 2026-11-21): an action
+     [{"say": "One!", "cues": [{"emotion": "excited", "action": "hop"}]}, {"wait": 1.0}, {"say": "Two!", "cues": [{"action": "hop"}]}]),
     ("say Goodbye | action bow",                                                        # a last move lands as the last line ends
      [{"say": "Goodbye"}, {"wait": scene.TAIL_S, "cues": [{"action": "bow"}]}]),
     ("emotion joy | say I spent mine learning to juggle. | action spin | on juggle",    # two moments on one line
@@ -64,7 +69,7 @@ def test_scripts_as_they_are_written(script, beats) -> None:
     ("look left | hold 90", "Step 2: hold is 0 to 30 seconds"),
     ("say Hi. | on there", "Step 2: 'on' follows the move it places"),
     ("action bow | on there", "Step 2: 'on' needs a line before it"),
-    ("say Hi. | bow", "Step 2: 'bow' needs a value, as in 'action bow'"),
+    ("say Hi. | !!!", "Step 2: '!!!' needs a value, as in 'action bow'"),
     ("say Hi. | say", "Step 2: 'say' needs something after it"),
     ([{"say": "Hi."}, {}], "Beat 2: needs a line to say or a time to wait"),
     ([{"say": "Hi."}, "wave"], "Beat 2: a beat is a set of named parts"),
@@ -239,3 +244,127 @@ def test_a_call_the_body_fits_plays_without_what_it_cannot_do() -> None:
                               " | emotion happy | look up | on Hi", fit=lenient)
     assert quiet.wait == 1.0 and quiet.cues == []                 # nothing left of that call but its hold: no cue, the quiet stays
     assert line == "Hi there." and line.cues == [{"emotion": "joy"}, {"look": "up", "on": "Hi"}]   # a kept move keeps its word
+
+
+# -- a scene with the other person's lines ------------------------------------
+
+TWO_SIDED = "say Hi, who are you? | emotion listening | listen My name is Sam | emotion joy | say Nice to meet you! | listen | say Bye!"
+
+
+def test_listen_is_the_other_persons_line_and_the_scene_stops_there_for_them() -> None:
+    lines = scene.lines(TWO_SIDED)
+    assert [(type(line).__name__, str(line), line.wait) for line in lines] == [
+        ("Line", "Hi, who are you?", 0.0), ("Line", "", scene.TAIL_S), ("Listen", "My name is Sam", 0.0),
+        ("Line", "Nice to meet you!", 0.0), ("Listen", "", 0.0), ("Line", "Bye!", 0.0)]
+    assert lines[1].cues == [{"emotion": "listening"}]       # a move before their line lands as hers ends: she reacts while they speak
+    mine, theirs, rest = scene.part(lines)
+    assert ([str(line) for line in mine], theirs, len(rest)) == (["Hi, who are you?", ""], "My name is Sam", 3)
+    mine, theirs, rest = scene.part(rest)
+    assert ([str(line) for line in mine], theirs, [str(line) for line in rest]) == (["Nice to meet you!"], "", ["Bye!"])
+    assert scene.part(rest) == (rest, None, [])              # none of their lines left: the scene's last part
+    assert scene.beats([{"say": "Hi."}, {"listen": "Hello"}, {"say": "Bye."}])[1] == {"listen": "Hello"}
+    # how much of their line was said, for the record: any words move the scene on
+    assert (scene.match("My name is Sam", "my name is Sam!"), scene.match("My name is Sam", "I like trains"), scene.match("", "anything")) == (1.0, 0.0, None)
+
+
+class QuickVoice:
+    sample_rate = 100
+
+    def synth(self, text: str):
+        yield chunk(0.01)                                    # over at once: the other person's turn comes straight away
+
+
+class Ears:
+    def __init__(self) -> None:
+        self.words = ""
+
+    def transcribe(self, audio) -> str:
+        return self.words
+
+
+def two_sided(voice):
+    runtime, events = Runtime(), []
+    engine = GemmaMultimodal(play=False, runtime=runtime, audio_mode="plain", output_mode="speech",
+                             on_event=events.append, config=MultimodalConfig(wake_required=False))
+    engine.node_tts, engine.node_stt = voice, Ears()
+
+    def hears(words: str) -> None:
+        engine.node_stt.words, engine._started = words, time.time()
+        engine._on_turn(np.zeros(1600, dtype=np.float32))
+
+    return engine, runtime, events, hears
+
+
+def test_a_two_sided_scene_waits_for_the_other_person_and_goes_on_from_what_they_say() -> None:
+    engine, runtime, events, hears = two_sided(QuickVoice())
+    key = engine.node_llm.session_key
+
+    engine.perform(TWO_SIDED)
+    assert [e.text for e in events if e.kind == "audio"] == ["Hi, who are you?", ""]          # her part, and no further
+    assert [(e.text, e.data) for e in events if e.kind == "scene"][-1] == ("listen", {"expect": "My name is Sam"})
+
+    events.clear()
+    hears("My name is Sam.")                                                                  # their line, spoken
+    assert [(e.kind, e.text) for e in events if e.kind in ("user", "scene", "audio")] == [
+        ("user", "My name is Sam."), ("scene", "heard"), ("scene", "begin"), ("audio", "Nice to meet you!"),
+        ("scene", "end"), ("scene", "listen")]
+    assert next(e.data for e in events if (e.kind, e.text) == ("scene", "heard")) == {
+        "said": "My name is Sam.", "expect": "My name is Sam", "match": 1.0}
+    assert [e.data.cues for e in events if e.kind == "audio"] == [[{"at": 0, "call": {"emotion": "joy"}}]]
+
+    events.clear()
+    engine.send_text("um, what was that again?")                                              # an ad-lib, typed: the scene keeps its place
+    assert [(e.kind, e.text) for e in events if e.kind in ("scene", "audio")] == [
+        ("scene", "heard"), ("scene", "begin"), ("audio", "Bye!"), ("scene", "end")]
+    assert runtime.turns == []                                                                # the model wrote none of it
+    assert runtime.notes == [(key, scene.DIRECTION, "Hi, who are you?"), (key, "My name is Sam.", "Nice to meet you!"),
+                             (key, "um, what was that again?", "Bye!")]                       # and the conversation holds both sides
+
+    engine.send_text("hello")                                                                 # the scene is over: the model answers again
+    assert runtime.turns == ["hello"]
+
+
+def test_what_is_heard_while_she_is_still_saying_her_line_does_not_move_the_scene_on() -> None:
+    engine, runtime, events, hears = two_sided(Voice())                                       # a line a second long
+    engine.perform("say Hi, who are you? | listen | say Bye!")
+    events.clear()
+    hears("Hi, who are you?")                                                                 # her own voice in the mic: the engine knows its own words
+    assert not [e for e in events if e.kind in ("user", "audio")]
+    hears("Wait, hang on a second.")                                                          # someone talking over her line
+    assert not [e for e in events if e.kind in ("user", "audio")]
+    assert [e.text for e in events if e.kind == "state"][-1].endswith("ignored")
+    engine.send_text("I'm Sam")                                                               # typed is always theirs
+    assert [e.text for e in events if e.kind == "audio"] == ["Bye!"]
+
+
+def test_stop_ends_a_scene_that_is_waiting() -> None:
+    engine, runtime, events, hears = two_sided(QuickVoice())
+    engine.perform("say Hi, who are you? | listen | say Bye!")
+    engine.end_scene()
+    engine.send_text("hello")
+    assert runtime.turns == ["hello"]
+
+
+def test_another_conversation_does_not_inherit_a_waiting_scene() -> None:
+    engine, runtime, events, hears = two_sided(QuickVoice())
+    engine.perform("say Hi, who are you? | listen | say Bye!")
+    engine.switch_session("someone else")
+    engine.send_text("hello")
+    assert runtime.turns == ["hello"]
+
+
+def test_a_scene_the_model_wrote_can_have_the_other_persons_lines_too() -> None:
+    class Acting(Runtime):
+        def run_turn(self, text: str, *, session_key: str) -> str:
+            self.turns.append(text)
+            self.engine.stage("say Knock knock. | listen Who's there? | say Boo.")
+            return ""
+
+    runtime, events = Acting(), []
+    engine = runtime.engine = GemmaMultimodal(play=False, runtime=runtime, audio_mode="plain", output_mode="speech",
+                                              on_event=events.append)
+    engine.node_tts = QuickVoice()
+    engine.send_text("tell me a knock knock joke")
+    engine.send_text("who's there?")
+    assert [e.text for e in events if e.kind == "audio"] == ["Knock knock.", "Boo."]
+    assert runtime.turns == ["tell me a knock knock joke"]

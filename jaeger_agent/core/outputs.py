@@ -138,9 +138,20 @@ _PLAIN_TAG = re.compile(r"</?(?!tool_call\b)[A-Za-z][\w:\- ]{0,40}>")
 _PLAIN_TAG_ARRIVING = re.compile(r"<(?:/?[A-Za-z][\w:\- ]{0,40})?/?")
 
 
+# A stage direction: "*yawn*", "*Puts hands over heart*". Gemma 4 writes them
+# into its words (4 of 39 turns, 2026-11-21) and a voice would read them out.
+# "**bold**" keeps its word; a lone star ("2 * 3") is left alone.
+_STAGE = re.compile(r"\*\*(.+?)\*\*|\*(?=\S)[^*\n]{0,80}?(?<=\S)\*")
+_STAGE_ARRIVING = re.compile(r"\*(?=\S)[^*\n]{0,80}\Z")   # one still being written
+
+
+def _unstaged(text: str) -> str:
+    return _STAGE.sub(lambda m: m.group(1) or " ", text)
+
+
 def _speakable(text: str) -> str:
-    """``text`` without made-up tags: a voice would read them out."""
-    return " ".join(_PLAIN_TAG.sub(" ", text or "").split())
+    """``text`` without made-up tags and stage directions: a voice would read them out."""
+    return " ".join(_unstaged(_PLAIN_TAG.sub(" ", text or "")).split())
 
 
 def decide_output(
@@ -216,7 +227,7 @@ class StreamedSpeech:
         self.spoken: list[str] = []
 
     def feed(self, piece: str) -> list[str]:
-        self._buf += piece
+        self._buf = _unstaged(self._buf + piece)
         out: list[str] = []
         arriving = len(self._buf) + 1   # where a tag that is still arriving starts, if one is
         while True:
@@ -261,8 +272,13 @@ class StreamedSpeech:
         if not (tail and "]" not in tail and len(tail) < 16
                 and "[OUTPUT:".startswith(tail.upper()[:8])):
             cut = len(self._buf)
+        # a stage direction still being written waits for its end, so its
+        # comma is not taken for the opening clause
+        if (stage := _STAGE_ARRIVING.search(self._buf)) is not None:
+            arriving = min(arriving, stage.start())
         cut = min(cut, arriving)
         out += self._sentences(self._buf[:cut], whole=False, keep=self._buf[cut:])
+        out = [re.sub(r" {2,}", " ", sentence).strip() for sentence in out]   # no gap where a direction was
         self.spoken += out
         return out
 

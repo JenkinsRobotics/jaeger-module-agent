@@ -1067,9 +1067,11 @@ class JaegerAgent:
             if (
                 msg.get("finish_reason") == "length"
                 and msg.get("tool_calls")
-            ):
+            ) or msg.get("finish_reason") == "tool_call_cut":
                 # Don't append the broken call to history — retry the
                 # same model step with the same input. One retry only.
+                # ("tool_call_cut": the adapter found a call that never
+                # closed, and has already taken it out of the words.)
                 self.callbacks.on_thinking(
                     "[truncated tool call detected — retrying once]"
                 )

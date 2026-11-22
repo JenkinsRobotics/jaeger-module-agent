@@ -366,3 +366,49 @@ def test_default_context_holds_the_default_tool_list_with_room_to_talk() -> None
     assert budget.prompt_budget - needed >= 8192, (
         f"{len(tools)} tools need ~{needed} tokens; ctx is {cfg.ctx}"
     )
+
+
+def test_example_exchanges_open_a_conversation_and_are_shown_once() -> None:
+    """A small model copies the form of what is already in the conversation
+    far more surely than it follows an instruction: with one example of a
+    tool call first, Gemma 4 E4B called the tool in 12 of 12 fresh
+    conversations, against 4 of 12 without (2026-11-21)."""
+    rt = DefaultAgentRuntime(adapter=ScriptedAdapter())
+    rt.warmup(session_key="voice", system_prompt="voice system")
+    examples = [("Hello!", "Hi! Good to see you!", [("avatar", {"emotion": "joy"}, {"ok": True})]),
+                ("Act it out.", "", [("scene", {"script": "say Hi."}, {"ok": True})])]
+
+    rt.prime("voice", examples)
+    rt.prime("voice", examples)                                      # shown once
+    rt.prime("nobody", examples)                                     # no such conversation: none is made up for it
+    shown = [
+        {"role": "user", "content": "Hello!"},
+        {"role": "assistant", "content": "Hi! Good to see you!",
+         "tool_calls": [{"id": "example_0", "name": "avatar", "args": {"emotion": "joy"}}]},
+        {"role": "tool", "tool_call_id": "example_0", "name": "avatar", "content": '{"ok": true}'},
+        {"role": "user", "content": "Act it out."},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "example_0", "name": "scene", "args": {"script": "say Hi."}}]},
+        {"role": "tool", "tool_call_id": "example_0", "name": "scene", "content": '{"ok": true}'},
+    ]
+    assert rt.agent_for("voice").messages == shown
+    assert rt.health()["sessions"] == 1
+
+    rt.run_turn("and now a real turn", session_key="voice")
+    rt.prime("voice", examples)                                      # the conversation is under way: nothing is added
+    assert rt.agent_for("voice").messages[:6] == shown
+    assert len(rt.agent_for("voice").messages) == 8
+    rt.close()
+
+
+def test_the_engine_shows_the_examples_to_the_conversation_it_is_in() -> None:
+    from jaeger_agent.core.engine import GemmaMultimodal
+
+    rt = DefaultAgentRuntime(adapter=ScriptedAdapter())
+    engine = GemmaMultimodal(play=False, runtime=rt, audio_mode="plain", on_event=lambda e: None)
+    engine.switch_session("mochi", "You are Mochi.")
+    engine.prime([("Hello!", "Hi!", [("avatar", {"emotion": "joy"}, {"ok": True})])])
+    assert [m["role"] for m in rt.agent_for("mochi").messages] == ["user", "assistant", "tool"]
+    engine.switch_session("vita", "You are Vita.")
+    assert rt.agent_for("vita").messages == []                       # each conversation is shown its own
+    rt.close()

@@ -20,6 +20,7 @@ when sharing one across adapters / instances).
 
 from __future__ import annotations
 
+import re
 import json
 import threading
 import time
@@ -60,6 +61,11 @@ _REASONING_STALL_FLOOR_S = 300.0
 # flag stays SET after we bail, so even a worker that misses this window
 # still self-terminates at its next token before the next case runs.
 _ABORT_JOIN_S = 1.5
+
+
+# Where Gemma opens a tool call: its own token, and the bare form it
+# sometimes writes instead.
+_CALL_OPENS = re.compile(r"<\|tool_call>|<call:")
 
 
 class _AbortGeneration(Exception):
@@ -856,6 +862,15 @@ class LocalLlamaAdapter(OpenAIAdapter):
             if not exc.worker_finished:
                 self._reset_after_abort()
             raise
+        except RuntimeError as exc:
+            # The decode itself failed (a compute failure on the GPU; seen
+            # 2026-11-22 on a machine out of memory, as ``llama_decode
+            # returned -3`` after a reply of one stray word). What the model
+            # has read is then unusable, and every later turn failed the same
+            # way until a restart. This turn is lost; the next starts clean.
+            if "llama_decode" in str(exc):
+                self._reset_after_abort()
+            raise
 
     def _reset_after_abort(self) -> None:
         """Bring the shared llama-cpp instance back to a clean state
@@ -946,10 +961,21 @@ class LocalLlamaAdapter(OpenAIAdapter):
             return message
         salvaged = extract_tool_calls(text)
         if not salvaged:
+            # A call that was started and never finished (cut at the length
+            # limit, or a runaway the stream stopped) is not words: it must
+            # not be shown, spoken, or handed back to "continue". The loop
+            # retries a cut call once.
+            opened = _CALL_OPENS.search(text)
+            if opened is not None:
+                message["content"] = text[:opened.start()].strip() or None
+                message["finish_reason"] = "tool_call_cut"
             return message
         # Strip the envelopes from the visible text so the loop doesn't
         # echo the markup back to the user on the final answer.
         cleaned = self._strip_tool_call_blocks(text).strip()
+        opened = _CALL_OPENS.search(cleaned)       # a further call, left unfinished
+        if opened is not None:
+            cleaned = cleaned[:opened.start()].strip()
         # Bare-JSON tool calls (no envelope) aren't removed by the
         # envelope stripper — so when the cleaned remainder is itself
         # just a tool-call JSON object, null it. Otherwise the model's

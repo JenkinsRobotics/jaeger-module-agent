@@ -401,3 +401,24 @@ def test_a_long_opening_with_no_comma_goes_out_at_a_breath_point() -> None:
 
     unheard = StreamedSpeech(mode="dynamic", input_modality="text")
     assert _fed(unheard, "I'm feeling super energetic and ready ") == []
+
+
+def test_stage_directions_between_asterisks_are_not_spoken() -> None:
+    """Gemma writes "*yawn*" and "*Puts hands over heart*" into its words (4 of 39
+    turns, 2026-11-21). A voice would read them out."""
+    stream = StreamedSpeech(mode="speech", input_modality="text")
+    assert _fed(stream, "*Puts hands over heart* Sending you the biggest heart! ",
+                "*yawn* Mmmph... Being sleepy is comfy. ") == [
+        "Sending you the biggest heart!", "Mmmph... Being sleepy is comfy."]
+    bold = StreamedSpeech(mode="speech", input_modality="text")
+    assert _fed(bold, "That is **really** good news. ") == ["That is really good news."]   # emphasis keeps its word
+    assert stream.rest("*Puts hands over heart* Sending you the biggest heart! *yawn* Mmmph... "
+                       "Being sleepy is comfy. *waves* Bye now!") == "Bye now!"
+
+
+def test_a_stage_direction_still_being_written_is_not_cut_at_its_comma() -> None:
+    stream = StreamedSpeech(mode="speech", input_modality="text")
+    assert _fed(stream, "*Waving enthusiastically, with ") == []      # the opening clause would have gone out here
+    assert _fed(stream, "both hands* Hi there, friend! ") == ["Hi there, friend!"]
+    math = StreamedSpeech(mode="speech", input_modality="text")
+    assert _fed(math, "Two * three is six. And so on. ") == ["Two * three is six.", "And so on."]   # a lone star is not a direction

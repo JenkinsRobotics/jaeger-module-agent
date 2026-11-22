@@ -28,6 +28,7 @@ Wire-format quirks vs Anthropic, all handled below:
 
 from __future__ import annotations
 
+import re
 import json
 import logging
 import threading
@@ -487,6 +488,14 @@ def _get(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
+# A runaway: the same few characters over and over at the end of an answer
+# (Gemma 4 E4B filled a tool call with one emoji until the length limit,
+# 2026-11-21). Twenty repeats is past any real sentence; a ruled line or a row
+# of dots is left alone.
+_RUNAWAY = re.compile(r"(.{1,12}?)\1{19,}\Z", re.DOTALL)
+_RULED = re.compile(r"[-=_*~.#|\s]+")
+
+
 def _aggregate_chat_stream(
     stream: Any,
     interrupt_event: threading.Event,
@@ -509,6 +518,7 @@ def _aggregate_chat_stream(
     repairs it downstream exactly as in the non-streamed path.
     """
     content_parts: list[str] = []
+    tail = ""
     calls_by_index: dict[int, dict[str, Any]] = {}
     finish_reason: Any = None
     usage: Any = None
@@ -534,6 +544,15 @@ def _aggregate_chat_stream(
                     content_parts.append(piece)
                     if on_delta is not None:
                         on_delta(piece)
+                    tail = (tail + piece)[-300:]
+                    run = _RUNAWAY.search(tail)
+                    if run is not None and not _RULED.fullmatch(run.group(1)):
+                        # Stop the model here (the stream is closed below)
+                        # and keep two of the repeats, not twenty.
+                        text = "".join(content_parts)
+                        content_parts[:] = [text[:len(text) - len(run.group(0)) + 2 * len(run.group(1))]]
+                        finish_reason = "repetition"
+                        break
                 for tc in _get(delta, "tool_calls") or []:
                     idx = _get(tc, "index")
                     idx = 0 if idx is None else int(idx)

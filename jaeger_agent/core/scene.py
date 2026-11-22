@@ -10,10 +10,17 @@ same):
 ``say <line>`` speaks a line. ``wait <seconds>`` is quiet. Any other step
 with a name and a value is a move for the body (the avatar tool takes
 ``emotion``, ``action`` and ``look``), handed as written to the body's tool.
+A step that is one bare word (``hop``) is an action of that name.
 A move rides on what comes next: it lands as the next line or quiet starts,
 and a last move lands as the last line ends. ``hold <seconds>`` holds the
 moves before it that long while the scene waits. ``on <word>`` puts the
 moves before it on that word of the line just said.
+
+``listen <their line>`` is the other person's turn: the scene stops there
+until they have spoken (or typed), then goes on. Their line is a prompt for
+them and no test: whatever they say moves the scene on, so a rough match or
+an ad-lib does not lose its place. Moves before it land as her own line
+ends, so she can react while they speak (``emotion listening | listen``).
 
 The same scene may be given as a list of beats, each with its own line,
 quiet and moves: ``[{"say": ..., "wait": ..., "look": ..., "on": ...}]``.
@@ -35,8 +42,8 @@ MAX_WAIT_S = 30
 TAIL_S = 0.2     # the quiet a scene's last move lands in, when nothing follows it
 # What the conversation remembers a scene by, so a question asked in one can be answered.
 DIRECTION = "(Stage direction: you performed a scene you were given. These were your lines.)"
-_WORDS = ("say", "wait", "hold", "on", "emotion", "action", "look")
-_JOINED = re.compile(r",\s*(?=(?:wait|hold|on|emotion|action|look)\s)", re.IGNORECASE)
+_WORDS = ("say", "wait", "hold", "on", "listen", "emotion", "action", "look")
+_JOINED = re.compile(r",\s*(?=(?:wait|hold|on|listen|emotion|action|look)\b)", re.IGNORECASE)
 
 
 class Clip(np.ndarray):
@@ -52,6 +59,30 @@ class Line(str):
         self = super().__new__(cls, text)
         self.cues, self.wait = cues or [], wait
         return self
+
+
+class Listen(str):
+    """The other person's line: the scene waits here until they have spoken.
+    Its words are what they are expected to say."""
+
+    cues: list = []
+    wait = 0.0
+
+
+def part(lines: list) -> tuple[list, Listen | None, list]:
+    """A scene up to the other person's next line: what to voice now, their
+    line (None when they have no more), and the rest of the scene."""
+    for i, line in enumerate(lines):
+        if isinstance(line, Listen):
+            return lines[:i], line, lines[i + 1:]
+    return lines, None, []
+
+
+def match(expect: str, said: str) -> float | None:
+    """How much of their expected line was said, 0 to 1; None when no words
+    were expected. For the record only: any words move the scene on."""
+    want, got = (re.findall(r"[a-z0-9']+", text.lower()) for text in (expect, said))
+    return round(sum(word in got for word in want) / len(want), 2) if want else None
 
 
 def _seconds(value: Any) -> float | None:
@@ -89,9 +120,18 @@ def _read(script: str) -> list[dict]:
         def bad(why: str) -> ValueError:
             return ValueError(f"Step {number}: {why}")
 
+        if key == "listen":
+            if moves:                     # she makes them as her own line ends, before theirs
+                beat({"wait": TAIL_S})
+            beats.append({"listen": value})
+            continue
+        if not value and key.isalpha() and key not in _WORDS:
+            # A move named bare ("hop", as Gemma 4 writes it): an action. The
+            # body's own fitting may know it for a feeling or a look instead.
+            key, value = "action", key
         if not value:
             raise bad(f"'{key}' needs something after it" if key in _WORDS
-                      else f"'{key}' needs a value, as in 'action {key}'")
+                      else f"'{key}' needs a value, as in 'action bow'")
         if key == "say":
             beat({"say": value})
         elif key in ("wait", "hold"):
@@ -131,6 +171,9 @@ def beats(script: Any) -> list[dict]:
 
             if not isinstance(given, dict):
                 raise bad("a beat is a set of named parts")
+            if "listen" in given:
+                found.append({"listen": str(given["listen"] or "")})
+                continue
             say, wait = given.get("say", ""), given.get("wait", 0)
             if not isinstance(say, str):
                 raise bad("say is the line, as words")
@@ -159,6 +202,9 @@ def lines(script: Any, fit: Callable[[dict], dict] | None = None) -> list[Line]:
     with no move left is dropped), or raises a ValueError to refuse the scene."""
     out = []
     for beat in beats(script):
+        if "listen" in beat:
+            out.append(Listen(beat["listen"]))
+            continue
         if "say" in beat:
             out.append(Line(beat["say"], beat.get("cues")))
         if beat.get("wait"):

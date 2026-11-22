@@ -30,6 +30,7 @@ runtime deliberately registers none of its own.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import time
@@ -364,13 +365,36 @@ class DefaultAgentRuntime:
         except Exception as exc:  # noqa: BLE001 — match run_turn's boundary
             return TurnResult(error=f"{type(exc).__name__}: {exc}")
 
-    def note(self, session_key: str, user_text: str, reply: str) -> None:
-        """Put one exchange that no turn produced (a performed scene) into an
-        open conversation, as a user line and the reply to it."""
+    def prime(self, session_key: str, examples: Any) -> None:
+        """Open a conversation with example exchanges, each ``(user_text,
+        reply, calls)`` as :meth:`note` takes them. They are shown once:
+        nothing is added to a conversation that already has a line in it."""
         agent = self._sessions.get(session_key)
-        if agent is not None:
-            agent.messages += [{"role": "user", "content": user_text},
-                               {"role": "assistant", "content": reply}]
+        if agent is not None and not agent.messages:
+            for user_text, reply, calls in examples:
+                self.note(session_key, user_text, reply, calls=calls)
+
+    def note(self, session_key: str, user_text: str, reply: str, *,
+             calls: Any = ()) -> None:
+        """Put one exchange that no turn produced into an open conversation,
+        as a user line and the reply to it: a performed scene, or an example
+        of how a turn should go.
+
+        ``calls`` are tool calls the reply made, each ``(name, arguments,
+        result)``; they are stored as a turn of the agent's own stores them,
+        so the model sees its own call form.
+        """
+        agent = self._sessions.get(session_key)
+        if agent is None:
+            return
+        said: dict[str, Any] = {"role": "assistant", "content": reply}
+        results = []
+        for index, (name, args, result) in enumerate(calls):
+            said.setdefault("tool_calls", []).append(
+                {"id": f"example_{index}", "name": name, "args": dict(args)})
+            results.append({"role": "tool", "tool_call_id": f"example_{index}",
+                            "name": name, "content": json.dumps(result)})
+        agent.messages += [{"role": "user", "content": user_text}, said, *results]
 
     def clear_session(self, session_key: str) -> None:
         """Discard one conversation without closing the shared runtime."""

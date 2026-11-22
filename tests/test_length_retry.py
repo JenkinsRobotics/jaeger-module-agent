@@ -217,3 +217,32 @@ def test_retry_budgets_match_legacy_hermes_constants():
     behaviour."""
     assert _JA._MAX_LENGTH_CONTINUE_RETRIES == 3
     assert _JA._MAX_TRUNCATED_TOOL_CALL_RETRIES == 1
+
+
+# ── a tool call that was started and never finished ────────────────
+
+def test_a_tool_call_cut_off_before_its_end_is_retried_once_not_continued():
+    """Gemma 4 E4B, asked to "put on a show", started a scene call and filled
+    it with one emoji until the length limit; three "continue" nudges went
+    on with the emoji, the turn took 68 s and the half call was read aloud
+    (2026-11-21). A call that never closed is a broken call: one silent
+    retry, never a text to continue."""
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": "Okay, a show!", "finish_reason": "tool_call_cut"},
+        {"role": "assistant", "content": "Here it comes.", "finish_reason": "stop"},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("put on a show") == "Here it comes."
+    assert adapter.call_count == 2
+    assert [m["role"] for m in agent.messages] == ["user", "assistant"]      # the broken answer is not kept
+
+
+def test_a_tool_call_cut_off_twice_ends_the_turn_with_the_words_it_did_say():
+    adapter = _ScriptedAdapter([
+        {"role": "assistant", "content": "Okay, a show!", "finish_reason": "tool_call_cut"},
+        {"role": "assistant", "content": "Okay, okay!", "finish_reason": "tool_call_cut"},
+        {"role": "assistant", "content": "never asked for", "finish_reason": "stop"},
+    ])
+    agent = JaegerAgent(adapter=adapter)
+    assert agent.run_turn("put on a show") == "Okay, okay!"
+    assert adapter.call_count == 2                                           # no third try, and no "continue" nudges

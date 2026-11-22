@@ -273,6 +273,11 @@ SILENCE_HANGOVER_MS = 500     # FAMILY CONTRACT (2026-09-01): fast endpoint;
 
 MIN_SPEECH_MS = 300           # family parity
 
+PRE_ROLL_MS = 300             # sound from just before the detector opened comes
+                              # with the phrase: it opens 150-300 ms into the
+                              # first word, and without this "I saw a dog" was
+                              # heard as "a dog" (measured 2026-11-22)
+
 HARD_MAX_SPEECH_MS = 45000
 
 SYSTEM_PROMPT = (
@@ -452,6 +457,7 @@ __all__ = [
     "SILENCE_HANGOVER_MS",
     "EARLY_DECODE_MS",
     "MIN_SPEECH_MS",
+    "PRE_ROLL_MS",
     "HARD_MAX_SPEECH_MS",
     "SYSTEM_PROMPT",
     "_CLOSERS",
