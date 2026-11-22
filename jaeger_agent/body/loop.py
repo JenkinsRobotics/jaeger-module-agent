@@ -31,6 +31,9 @@ when a part is all voiced, and the host answers {op: played, n} when its speaker
 agent goes on listening (listens_while_thinking), so a person who was only pausing can go on and is answered once, whole.
 The engine says when each turn is over; that is this worker's 'done'.
 
+Who she is comes as {persona: the whole text} or as {who, body, offers}, from which the agent writes the text with its own
+rules for a character in a body (told, persona.py).
+
 In (one JSON line each): {op: start, ...} first, then {op: text | audio | persona | interrupt | control_result | say | scene | cue | played}.
 Out: {ready, schema, model, report}, {event, text, data}, {event: audio, text, rate, pcm, marks, cues}, {event: done}, {control, id},
 {id, rate, pcm, marks, ms} (the answer to say), {report} (after a voice change), {event: scene, text: begin | end} (around a scene's sound), {event: scene, text: refused, data} (a script it could not read),
@@ -62,6 +65,17 @@ EXAMPLES = [
     ('Act out a tiny scene: look up, wait a second, then tell me what you saw.', '',
      [('scene', {'script': 'look up | hold 1 | look center | emotion surprised | say I just saw a shooting star!'}, {'ok': True, 'note': 'The scene plays now.'})]),
 ]
+
+
+def told(r):
+    """What the character is told, from a host's start line or its persona line. A host that names the character, its
+    body and what the body offers ({who, body, offers}) leaves the rules to the agent (persona.py): a host in another
+    Python cannot import them, and they are the agent's to change. A host that sends the whole text ({persona}) is taken
+    at its word."""
+    if 'persona' in r: return str(r['persona'] or '')
+    if not r.get('who'): return ''
+    from .persona import persona
+    return persona(str(r['who']), r.get('body', ''), r.get('offers'))
 
 
 class Body:
@@ -222,7 +236,7 @@ class Loop:
                 if op == 'text': self.engine.send_text(str(r.get('text', '')))
                 elif op == 'persona':   # who it is now, and (when the app names one) the character's voice in the same voice module
                     voice = r.get('voice')
-                    self.engine.switch_session(r['session'], r.get('persona', ''), **({'voice': voice} if voice else {}))
+                    self.engine.switch_session(r['session'], told(r), **({'voice': voice} if voice else {}))
                     if self.examples: self.engine.prime(self.examples)
                     if voice: self.emit({'report': self.report()})
                 elif op == 'say': self.say(r)
@@ -296,7 +310,7 @@ def main():
     engine = loop.engine = GemmaMultimodal(
         on_event=loop.on_event, play=not open_mic, half_duplex=not open_mic, listens_while_thinking=True,
         outputs=[] if open_mic else [loop.body] if loop.body else None,
-        output_mode='speech', extra_prompt=start.get('persona', ''),
+        output_mode='speech', extra_prompt=told(start),
         config=MultimodalConfig(output_mode='speech', wake_required=False,
                                 stt_model=start.get('hearing', 'large-v3-turbo'), session_key=start.get('session', 'avatar'),
                                 **({'kokoro_voice': start['voice']} if start.get('voice') else {})),   # the character's own voice, when the host names one

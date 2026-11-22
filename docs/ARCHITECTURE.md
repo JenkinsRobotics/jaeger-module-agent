@@ -770,7 +770,7 @@ the agent**, the agent never pulls. Mochi already does this
 `0.11.0`. Each remaining coupling wants the same treatment — a seam here,
 filled by whichever application is hosting.
 
-### The body — the `animation` slot (written 2026-11-22, not yet run)
+### The body — the `animation` slot (2026-11-22)
 
 The agent's face and moves come from whatever Jaeger module fills the
 `animation` slot, opened as the voice and the hearing are
@@ -782,10 +782,16 @@ voice loop started for a body (`loop.py`), a host's side of it (`host.py`)
 and the two joined (`device.py`: `Device(AgentHost(), bundle, speaker=...)`).
 With nothing in the slot, or a module there that has no `open_body`, the
 agent is a voice with no face: no avatar or scene tool, its own speaker.
-This code came from JaegerAvatar's `jaeger_avatar/embedded`, which still
-holds the copy every host runs today; the plan and its steps are in
-jaeger-module-animation `dev/docs/20261122_avatar_engine_move.md`.
-`tests/test_body.py` covers it and has not been run.
+A host in another Python (the Jaeger Avatar app's server) starts the same
+worker and names the character, the body and what it offers (`{who, body,
+offers}`); the worker writes what she is told from the agent's own rules
+(`told`). Since 2026-11-22 this is the only copy: the Jaeger Avatar app,
+Mochi's launcher and the JP01 stand-in all run it, and JaegerAvatar's
+`jaeger_avatar/embedded` keeps only the body's own files. Tests:
+`tests/test_body.py`, `tests/test_body_loop.py`, `tests/test_body_tools.py`
+(the last two came with the code). Run live that day, sound muted: the
+simulated JP01, a typed and three spoken turns in the app, and Mochi's
+scenes.
 
 ---
 
