@@ -266,6 +266,32 @@ for the result, as it was trained to.
   its prompt: measured on gemma-4-E4B, "begin every reply with one avatar
   tool call" plus the example moved the body on 42 of 42 turns; the rule
   without the example, or "call it together with your words", on 1 to 3 of 7.
+- `engine.prime(examples)` (`core/engine.py`, `core/runtime.py::prime`) opens
+  a conversation with example exchanges, each `(what was said, the reply, the
+  tool calls it made)`, stored as ordinary tool calls and results and shown
+  once while the conversation is still empty. This replaced the in-prompt
+  example for Jaeger Avatar. Measured on gemma-4-E4B, 2026-11-21, M1 Max:
+  with the rule and the in-prompt example, the first turn of a fresh
+  conversation called the avatar tool in 4 of 12 and wrote the call out as
+  words ("emotion:joy,action:clap", read aloud) in the other 8, and whatever
+  it did first it went on doing for that conversation; with one example
+  exchange first, 24 of 24, and with two (a reply and a scene) 12 of 12.
+  Over every kind of request, the body moved in 215 of 215 turns (16 of 39
+  before, in one pass). Cost: the turn that used to speak junk from one
+  model call now makes two, so first sound is about 0.8-1.8 s (median, by
+  kind of request) where the junk turns were 0.3-0.5 s.
+- A reply that runs away is stopped (`adapters/openai.py::_RUNAWAY`): the same
+  1 to 12 characters 20 times in a row at the end of the stream ends it with
+  `finish_reason = "repetition"`. Seen once in 78 turns (0 in the 227 after): gemma-4-E4B
+  filled a scene call with one emoji to the length limit, the "continue"
+  retries tripled it (68 s) and the unclosed call was spoken. A call left
+  unclosed is now cut from the words (`adapters/local_llama.py`,
+  `finish_reason = "tool_call_cut"`) and the turn is asked again once, with no
+  "continue" (`loop/jaeger_agent.py`). The guard reads streamed replies only.
+- Stage directions the model writes into its words (`*waves happily*`) are
+  not spoken (`core/outputs.py::_STAGE`); `**bold**` keeps its words.
+- In a scene script a bare word is a move (`hop` = `action hop`,
+  `core/scene.py`); gemma-4 writes them that way about as often as not.
 - Tool results go back in the form the model's own template writes
   (`adapters/local_llama.py::_fold_tool_results`). The OpenAI wire shape
   carries each result as a `tool` message; gemma-4's template has no such
@@ -376,6 +402,29 @@ for the result, as it was trained to.
   "call": {...}}]`). Quiet goes out as silent sound, so the sound's clock is
   the only clock a player needs. Whoever plays the clip makes the call when
   the clip's clock reaches `at`; the engine does not make it.
+  A scene for two: `listen <their line>` is the other person's turn. The
+  engine voices the scene up to it (`scene.part`), emits `("scene",
+  "listen", {"expect": their line})` and keeps the rest (`_scene`). The next
+  thing typed or heard is their line, whatever its words: the engine emits
+  `("scene", "heard", {"said", "expect", "match"})`, where `match` is the
+  share of the expected words that were said (for the record, never a test),
+  and performs the next part, with no model call. Both sides join the
+  conversation (`runtime.note(their words, her lines)`). What is heard while
+  her own part is still being played is set aside (state "… ignored"): her
+  part is over once the sound that turn made has had time to play, counted
+  from its last clip, less `SCENE_GRACE_S`. Typed words always count.
+  A waiting scene takes their line as it was said: HOLDING does not apply
+  to it (written 2026-11-22 with `tests/test_holding.py`, not yet run).
+  `end_scene()` (a host's Stop), a goodbye, or a change of conversation ends
+  a waiting scene. Measured in Jaeger Avatar, 2026-11-21, a scene of four
+  beats with three lines for the person: typed 16 of 16 beats over four
+  runs, spoken (recorded speech as the microphone, a second voice, one line
+  word for word, one roughly, one an ad-lib) 16 of 16 over four runs.
+  gemma-4-E4B, asked for a scene for two, wrote one with `listen` that
+  waited for the person in 16 of 16 fresh conversations, most with a single
+  turn for the person. Not done: a second voice for the other side's lines;
+  an answer from the model to an ad-lib before the scene goes on; the
+  player saying when it has finished her part.
   Both take `fit`, the body's say on each call a cue will make, asked
   before a word is said: it hands back the call as the body can make it
   (the same, or with parts left out; a call with no move left is dropped)
@@ -660,6 +709,29 @@ Where the boundary holds:
   quiet that ends a phrase will not come. A reply cut at a token keeps what
   the model has read (`adapters/local_llama.py`); only a decode still running
   when the wait for it ran out resets the model, as a stall does.
+  **A pause is not the end of what they were saying** (2026-11-22). A phrase
+  ends on 500 ms of quiet, and a person thinking of their next words is quiet
+  for longer; what they have said so far usually reads as finished, so
+  HOLDING does not catch it (measured: 12 of 12 long sentences with a pause
+  of 0.5 to 1 s inside were answered in halves). So until her first sound, a
+  person who goes on talking was not finished. A new phrase long enough to
+  be speech (`MIN_SPEECH_MS`) is counted (`_picked_up`); the turn answering
+  what came before sees that it has gone (`_gone`: before the model is asked,
+  after it answers, before the first sound), gives no answer, and keeps the
+  sound of what was said (`_carry`). The next phrase is heard as one with it,
+  in a single pass, so the words across the pause are right. A phrase still
+  being made out when they go on is carried the same way, and its hearing
+  pass is told nobody needs it. Phrases are made out in the order they were
+  said. Once she has made a sound it is a cut-in, as before. This needs the
+  mic heard while she thinks: always so with an open mic; with the default
+  closed one the turn is answered on the thread that brings the sound, so a
+  caller that brings it in real time asks with `listens_while_thinking=True`
+  (the mic is still shut while she speaks). Two smaller things found with
+  it: the sound from just before the detector opened comes with the phrase
+  (`PRE_ROLL_MS`; without it "I saw a dog" was heard as "a dog"), and a sound
+  too short to be a phrase is let go after the quiet (left open it took in
+  all the quiet up to the next phrase, and hearing made "Thank you." out of
+  it). `tests/test_open_mic.py` has each.
 - The instance layout is **injected**, not fetched: `workspace.bind(layout)`
   wires all tool I/O to a host-chosen directory at startup, and the
   `InstanceLayout` type import is `TYPE_CHECKING` only.
@@ -684,6 +756,23 @@ the agent**, the agent never pulls. Mochi already does this
 (`modules/jaeger_agent.py :: set_persona`), and JaegerAI adopted it in
 `0.11.0`. Each remaining coupling wants the same treatment — a seam here,
 filled by whichever application is hosting.
+
+### The body — the `animation` slot (written 2026-11-22, not yet run)
+
+The agent's face and moves come from whatever Jaeger module fills the
+`animation` slot, opened as the voice and the hearing are
+(`core/parts.open_part("animation", "open_body", bundle=...)`), never by
+import (`tests/test_module_boundary.py` keeps `jaeger_animation` forbidden).
+`jaeger_agent/body/` holds what is the agent's own: the avatar and scene
+tools (`tools.py`), what a character in a body is told (`persona.py`), the
+voice loop started for a body (`loop.py`), a host's side of it (`host.py`)
+and the two joined (`device.py`: `Device(AgentHost(), bundle, speaker=...)`).
+With nothing in the slot, or a module there that has no `open_body`, the
+agent is a voice with no face: no avatar or scene tool, its own speaker.
+This code came from JaegerAvatar's `jaeger_avatar/embedded`, which still
+holds the copy every host runs today; the plan and its steps are in
+jaeger-module-animation `dev/docs/20261122_avatar_engine_move.md`.
+`tests/test_body.py` covers it and has not been run.
 
 ---
 
