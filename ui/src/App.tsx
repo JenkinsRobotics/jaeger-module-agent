@@ -1,8 +1,11 @@
 /** Jaeger Agent's own UI: talk to the running loop, watch everything it does — in today's Jaeger design.
- * Owned by this module; the shared pieces (tokens, feed shaping) are structured to come from the
- * Nexus UI library once it is extracted from JaegerAI. */
+ * Owned by this module. Its container and navigation are the NexusUI app shell (app-shell/, copied from NexusUI:
+ * Aether Studio's sidebar, no header); the page inside it is unchanged. */
 import { useEffect, useRef, useState } from "react";
 import { FEED_SKIP, feedBody, feedLabel, type LoopEvent } from "./events";
+import { AppShell } from "./app-shell/AppShell";
+
+const MARK = <svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="18" fill="#1c2034" /><rect x="14" y="20" width="13" height="24" rx="6" fill="#5fe0d0" /><rect x="37" y="20" width="13" height="24" rx="6" fill="#5fe0d0" /></svg>;
 
 type Msg = { who: "user" | "agent"; text: string };
 
@@ -47,15 +50,14 @@ export function App() {
     void fetch("/say", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
   };
 
+  const line = ready ? [model, status].filter(Boolean).join(" · ") : "loading the agent…";
   return (
+    <AppShell id="jaeger-agent" brand={{ name: "Jaeger", suffix: "Agent", mark: MARK }}
+      sections={[{ id: "workspace", title: "Workspace", items: [{ id: "home", label: "Conversation", icon: "comment" }] }]} current="home"
+      tools={[{ id: "stop", label: "Stop speaking", icon: "close", onSelect: () => void fetch("/interrupt", { method: "POST" }) }]}
+      profile={{ name: "Jaeger Agent", detail: line, avatar: MARK, connection: ready ? "connected" : "waiting" }}
+      status={{ name: "Jaeger Agent", connection: ready ? "connected" : "waiting", message: line, company: "Jenkins Robotics" }}>
     <div id="app">
-      <header>
-        <span className="brand">
-          <svg viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="18" fill="#1c2034" /><rect x="14" y="20" width="13" height="24" rx="6" fill="#5fe0d0" /><rect x="37" y="20" width="13" height="24" rx="6" fill="#5fe0d0" /></svg>
-          Jaeger Agent
-        </span>
-        <span id="status"><i id="light" data-on={ready} /> {ready ? [model, status].filter(Boolean).join(" · ") : "loading the agent…"}</span>
-      </header>
       <section className="panel" aria-label="Conversation">
         <h2>Conversation</h2>
         <div id="messages" role="log">
@@ -80,5 +82,6 @@ export function App() {
         </div>
       </section>
     </div>
+    </AppShell>
   );
 }
