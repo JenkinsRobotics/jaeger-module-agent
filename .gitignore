@@ -70,3 +70,4 @@ htmlcov/
 # repo root mints one here: runtime state (memory db, logs, workspace
 # files), never source.
 .jaeger_agent/
+ui/node_modules/

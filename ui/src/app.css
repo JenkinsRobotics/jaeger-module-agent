@@ -1,0 +1,30 @@
+/* The agent's own UI, in today's Jaeger design: tokens.css is the copied Aether block (the same one
+   JaegerAvatar and Nexus render), mapped onto the app variables the Studio look uses. */
+@import "./tokens.css";
+:root { color-scheme:dark; --bg:var(--aether-color-bg-app); --panel:var(--aether-color-bg-panel); --panel2:var(--aether-color-bg-control); --line:var(--aether-color-border); --ink:var(--aether-color-text); --dim:var(--aether-color-text-dim); --accent:var(--aether-color-accent); --accent-ink:var(--aether-color-text-on-selected); --hot:var(--aether-color-error); }
+* { box-sizing:border-box; }
+html, body, #root { height:100%; margin:0; }
+body { background:var(--bg); color:var(--ink); font:14px/1.4 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+#app { display:grid; grid-template:auto minmax(0,1fr) / minmax(0,1.4fr) minmax(320px,1fr); gap:10px; height:100%; padding:0 12px 12px; }
+header { grid-column:1/-1; display:flex; align-items:center; gap:14px; padding:10px 2px 0; }
+.brand { display:flex; align-items:center; gap:8px; font-size:17px; font-weight:700; letter-spacing:-.01em; }
+.brand svg { width:26px; height:26px; }
+#status { margin-left:auto; color:var(--dim); font-size:12px; display:flex; align-items:center; gap:7px; }
+#light { width:7px; height:7px; border-radius:50%; background:var(--aether-color-warn); }
+#light[data-on="true"] { background:var(--accent); box-shadow:0 0 0 3px #5fe0d022; }
+section.panel { min-height:0; display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line); border-radius:16px; overflow:hidden; padding:12px; gap:10px; }
+h2 { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); margin:0; }
+.note { color:var(--dim); font-size:12px; }
+#messages { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:8px; scrollbar-width:thin; }
+.msg { max-width:85%; padding:8px 12px; border-radius:12px; background:var(--panel2); border:1px solid var(--line); white-space:pre-wrap; overflow-wrap:anywhere; }
+.msg[data-who="user"] { align-self:flex-end; background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+form { display:flex; gap:8px; }
+textarea { flex:1; resize:none; font:inherit; color:var(--ink); background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:8px 12px; }
+button { font:inherit; color:var(--ink); background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:6px 12px; cursor:pointer; }
+button:hover { background:var(--aether-color-bg-control-hover); }
+button.send { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); font-weight:600; }
+#feed { flex:1; min-height:0; overflow-y:auto; display:flex; flex-direction:column; gap:5px; font-size:12px; scrollbar-width:thin; }
+.tele { border-left:3px solid var(--line); padding:1px 8px; color:var(--dim); overflow-wrap:anywhere; }
+.tele b { color:var(--ink); font-weight:600; text-transform:capitalize; }
+.tele[data-kind="tool"] { border-left-color:var(--accent); } .tele[data-kind="tool"] b { color:var(--accent); }
+.tele[data-kind="assistant"] { border-left-color:#9d8cff; } .tele[data-kind="user"] { border-left-color:#7cc7ff; }

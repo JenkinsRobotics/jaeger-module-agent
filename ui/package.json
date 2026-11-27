@@ -1,0 +1,27 @@
+{
+  "name": "jaeger-agent-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Jaeger Agent's own UI: conversation and live telemetry for a running voice loop. React on the Jaeger design tokens; the built bundle ships in jaeger_agent/ui/static.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3",
+    "vitest": "^2.1.8"
+  }
+}
