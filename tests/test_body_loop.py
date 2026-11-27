@@ -155,6 +155,12 @@ class LoopTest(unittest.TestCase):
         body.wait()
         self.assertLess(time.time() - began, 1)
 
+    def test_each_host_picks_one_of_the_agents_ways_of_taking_turns(self):
+        self.assertEqual(agent_loop.duplex({}), (False, {'play': True, 'half_duplex': True, 'audio_mode': None}))   # a bare speaker: half duplex
+        self.assertEqual(agent_loop.duplex({'open_mic': True}), (True, {'play': False, 'half_duplex': False, 'audio_mode': None}))   # the page cancels the echo
+        self.assertEqual(agent_loop.duplex({'audio_mode': 'quasi'}), (True, {'play': True, 'half_duplex': False, 'audio_mode': 'quasi'}))   # the agent's own device
+        self.assertFalse(agent_loop.duplex({'audio_mode': 'quasi', 'mute': True})[1]['play'])
+
     def test_character_switch_and_interrupt(self):
         self.run_all({'op': 'persona', 'session': 's:mochi', 'persona': 'You are Mochi.'}, {'op': 'interrupt'})
         self.assertEqual([c[:3] for c in self.engine.calls if c[0] != 'examples'], [('scene over',), ('stop',), ('persona', 's:mochi', 'You are Mochi.')])   # an interrupt does not wait its turn, and ends a scene that was waiting for the other person

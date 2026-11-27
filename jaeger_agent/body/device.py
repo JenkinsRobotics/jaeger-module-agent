@@ -24,6 +24,7 @@ a fix made there is made here too. The player and the mouth went to the animatio
 """
 import base64
 import threading
+from pathlib import Path
 import time
 
 import numpy as np
@@ -118,18 +119,32 @@ class Device:
         self._send({'op': 'audio', 'pcm': base64.b64encode((np.clip(frame, -1, 1) * 32767).astype('<i2').tobytes()).decode()})
 
     def run(self, rows, wait_s=120):
-        """A run with nobody at the keyboard: rows of "say: words", "scene: steps" or "sleep: seconds", each sent once the
-        turn before it has ended and the last of it has been played."""
+        """A run with nobody at the keyboard: rows of "say: words", "scene: steps or a script file", "hear: a WAV file"
+        (said into the microphone in real time, as a person would) or "sleep: seconds", each sent once the turn before it
+        has ended and the last of it has been played."""
         for row in rows:
             kind, _, value = row.partition(':')
             kind, value = kind.strip(), value.strip()
             if not value or kind.startswith('#'): continue
             if kind == 'sleep': time.sleep(float(value)); continue
             while self.turns.acquire(blocking=False): pass
-            (self.text if kind == 'say' else self.scene)(value)
+            if kind == 'hear': self.say_into_mic(value)
+            elif kind == 'say': self.text(value)
+            else: self.scene(Path(value).read_text() if '|' not in value and Path(value).suffix in ('.scene', '.txt') and Path(value).is_file() else value)
             self.turns.acquire(timeout=wait_s)               # the agent has finished the turn
             time.sleep(0.2)
             if self.body: self.body.player.wait(wait_s)      # and the body has played the last of it
+
+    def say_into_mic(self, wav, quiet_s=1.0):
+        """A WAV said into the microphone at its own pace, then quiet_s of silence so the phrase is heard to end."""
+        import wave
+        with wave.open(str(wav)) as w:
+            rate, sound = w.getframerate(), np.frombuffer(w.readframes(w.getnframes()), '<i2').astype(np.float32) / 32768
+        sound = np.concatenate([np.interp(np.arange(0, len(sound), rate / 16000), np.arange(len(sound)), sound), np.zeros(int(16000 * quiet_s))])
+        start = time.monotonic()
+        for i in range(0, len(sound), 480):          # 30 ms frames, in real time
+            time.sleep(max(0, start + i / 16000 - time.monotonic()))
+            self.hear(sound[i:i + 480].astype(np.float32))
 
     def stop(self):
         """Stop: the reply or the scene ends, and a scene that was waiting for its other line is over."""

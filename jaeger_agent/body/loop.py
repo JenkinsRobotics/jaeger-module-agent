@@ -23,7 +23,7 @@ says so; the move is then made by the same `avatar` tool the model calls. The mo
 
 Turn-taking is the agent's own, with its own settings (its audio mode, its half duplex): when a phrase has ended, whether
 the thought is finished or she should wait for the rest (HOLDING), and when the microphone is shut. This worker sets none of it.
-The start line says only what the agent cannot know, {open_mic: true}: this host's microphone has an echo canceller (the
+The start line says only what the agent cannot know, {open_mic: true} (or {audio_mode: quasi}, below): this host's microphone has an echo canceller (the
 browser page), so sound goes straight to the engine, never behind a turn, and a person can talk over her. Every other host
 (Mochi, a robot: a bare speaker and microphone) gets the agent's half duplex: the microphone is shut from her first word
 until the body's speaker has played her last. The body plays the sound, so it says when: the worker sends {event: voiced, n}
@@ -258,6 +258,17 @@ class Loop:
                 if op in ('text', 'scene') and not self.ended: self.emit({'event': 'done'})   # it never began, and the page is waiting
 
 
+def duplex(start):
+    """How this host takes turns with her, from its start line: (open mic?, the engine's play, half_duplex and audio_mode).
+    Half duplex (the default): the host plays, the mic is shut until it says it has. {open_mic: true}: the host's own
+    echo canceller (the browser page). {audio_mode: quasi | full}: the agent's own echo-cancelling device plays and
+    hears ({mute: true} keeps that device silent, for a test run)."""
+    own_io = start.get('audio_mode') in ('quasi', 'full')
+    open_mic = bool(start.get('open_mic')) or own_io
+    return open_mic, {'play': (own_io and not start.get('mute')) or not open_mic, 'half_duplex': not open_mic,
+                      'audio_mode': start['audio_mode'] if own_io else None}
+
+
 def model_choice(name, llms, default):
     """Which of Jaeger Agent's own models to run (its table, core/policy.py): the one named, by the agent's key or by its file's
     name as Settings shows it, when that file is on this machine; else the agent's default; None when that file is missing too."""
@@ -314,10 +325,13 @@ def main():
     # speaker is the engine's output (Body), so the microphone is shut until the body has played her words. Only a host
     # whose microphone has an echo canceller (the browser page) asks for the agent's open mic, and then plays with no word back.
     # With no body the voice goes to the agent's own speaker (outputs=None: its default).
-    open_mic = bool(start.get('open_mic'))
+    # {audio_mode: quasi}: a host with a bare speaker and microphone (Mochi on a Mac) that still wants to be talked over.
+    # The agent then opens its own echo-cancelling duplex device (48 kHz, pyaec) and plays and hears through it; the host
+    # gets the same audio events, for the face only, and must neither play them nor send its microphone.
+    open_mic, turns = duplex(start)
     if faced and not open_mic: loop.body = Body(emit)
     engine = loop.engine = GemmaMultimodal(
-        on_event=loop.on_event, play=not open_mic, half_duplex=not open_mic, listens_while_thinking=True,
+        on_event=loop.on_event, listens_while_thinking=True, **turns,
         outputs=[] if open_mic else [loop.body] if loop.body else None,
         output_mode='speech', extra_prompt=told(start),
         config=MultimodalConfig(output_mode='speech', wake_required=False,

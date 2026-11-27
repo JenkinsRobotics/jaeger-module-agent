@@ -57,3 +57,17 @@ def test_her_manner_rides_on_each_turn_and_changes_between_turns() -> None:
     engine.manner = ""
     engine.send_text("And now?")
     assert runtime.asked[-1] == "And now?"
+
+
+class _LaughingVoice(_Voice):
+    def sounds(self) -> list:
+        return ["giggle", "laugh"]
+
+
+def test_a_voice_with_real_laughs_tells_the_model_how_to_write_one_and_one_without_says_nothing() -> None:
+    engine = GemmaMultimodal(play=False, runtime=_Runtime(), audio_mode="plain", output_mode="speech",
+                             config=MultimodalConfig(wake_required=False))
+    engine.node_tts = _Voice()
+    assert "[laugh]" not in engine._system_prompt()
+    engine.node_tts = _LaughingVoice()
+    assert "[giggle], [laugh]" in engine._system_prompt()

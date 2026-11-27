@@ -1036,6 +1036,12 @@ class GemmaMultimodal:
             system = f"{system}\n{self.extra_prompt}"
         if self.config.output_mode == "dynamic":
             system = f"{system}{DYNAMIC_OUTPUT_PROMPT}"
+        sounds = getattr(self.node_tts, "sounds", lambda: [])()
+        if sounds:                        # the voice plays a real recording for each: a laugh that is a laugh, not the word
+            tags = ", ".join(f"[{s}]" for s in sounds[:8])
+            system = (f"{system}\nYour voice makes these sounds for real: {tags}. Where you would laugh, sigh or gasp, write "
+                      f"that tag on its own in your reply. Use one when something is really funny or moving, not in every "
+                      f"reply, and never write \"haha\".")
         return system
 
     def _answer(self, user_text: str, image, on_delta=None) -> str:

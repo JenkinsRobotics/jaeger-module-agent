@@ -38,6 +38,12 @@ class MouthKokoro:
         self.info = {**info, "model": voice}
         self._acts = "feeling" in inspect.signature(self.tts.synth).parameters
 
+    def sounds(self) -> list:
+        """The sounds that are not words (laugh, giggle...) the voice module has real recordings of in the voice now set,
+        written in a line as [laugh]; none when the module keeps no such bank."""
+        names = getattr(getattr(self.tts, "sounds", None), "names", None)
+        return list(names(self.voice)) if names else []
+
     @property
     def sample_rate(self) -> int:
         """The voice's own rate; nothing downstream assumes one."""
